@@ -80,6 +80,7 @@ dependencies = [
     "anthropic>=0.40",
     "loguru>=0.7",
     "python-multipart>=0.0.9",
+    "boto3>=1.34",
 ]
 
 [project.optional-dependencies]
@@ -1934,13 +1935,15 @@ def _analyze_and_log(source_file: str, bucket: str, local_path: str) -> None:
     logger.log(level, json.dumps(report, ensure_ascii=False))
 ```
 
-- [ ] **Step 4: Install boto3 (needed for S3 download)**
+- [ ] **Step 4: Verify boto3 is already in dependencies**
+
+`boto3` was added to `pyproject.toml` in Task 1. Confirm it is present:
 
 ```bash
-uv pip install boto3
+grep boto3 pyproject.toml
 ```
 
-Add `"boto3>=1.34"` to `pyproject.toml` dependencies.
+Expected: `"boto3>=1.34"` appears.
 
 - [ ] **Step 5: Run tests**
 
@@ -2098,11 +2101,26 @@ docker compose logs -f minio-init
 
 Expected: `MinIO setup complete` in logs.
 
-- [ ] **Step 2: Upload a test MCAP**
+- [ ] **Step 2: Create a minimal synthetic MCAP and upload it**
+
+```python
+# create_test_mcap.py — run once to generate a test file
+from mcap.writer import Writer
+with open("/tmp/test.mcap", "wb") as f:
+    writer = Writer(f)
+    writer.start(profile="", library="test")
+    schema_id = writer.register_schema(name="std_msgs/String", encoding="ros2msg", data=b"string data\n")
+    chan_id = writer.register_channel(topic="/test", message_encoding="cdr", schema_id=schema_id)
+    import time; t = int(time.time() * 1e9)
+    writer.add_message(channel_id=chan_id, log_time=t, data=b"\x00\x00\x00\x00\x05\x00\x00\x00hello", publish_time=t)
+    writer.finish()
+print("Created /tmp/test.mcap")
+```
 
 ```bash
-# Install mc locally or use docker exec
-docker exec -it <minio-init-container> mc cp /path/to/test.mcap myminio/robot-uploads/
+python create_test_mcap.py
+docker compose cp /tmp/test.mcap minio:/tmp/test.mcap
+docker compose exec minio mc cp /tmp/test.mcap myminio/robot-uploads/test.mcap
 ```
 
 - [ ] **Step 3: Watch agent logs**
