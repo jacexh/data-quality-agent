@@ -33,16 +33,16 @@ Webhook Server (FastAPI, POST /notify)
   │  async background task: download .bag to temp dir
   ▼
 BagExtractor
-  ├─ frames: list[np.ndarray]              (camera topic → video frames)
-  ├─ audio_wav: bytes | None               (audio topic → wav)
+  ├─ frames: list[np.ndarray]              (camera topic → video frames, may be empty)
+  ├─ audio_frames: list[bytes] | None      (audio topic → 30ms PCM frames, 16kHz mono int16)
   └─ sensor_series: dict[str, ndarray]     (IMU/joint topics → time series)
   ▼
 AnalysisPipeline  (concurrent.futures.ThreadPoolExecutor)
-  ├─ ClarityAnalyzer      → ClarityResult
-  ├─ ContinuityAnalyzer   → ContinuityResult
-  ├─ FaceDetector         → FaceResult
-  ├─ VoiceDetector        → VoiceResult
-  └─ GaitDetector         → GaitResult
+  ├─ ClarityAnalyzer      → ClarityResult      (name: "clarity")
+  ├─ ContinuityAnalyzer   → ContinuityResult   (name: "continuity")
+  ├─ FaceDetector         → FaceResult         (name: "face")
+  ├─ VoiceDetector        → VoiceResult        (name: "voice")
+  └─ GaitDetector         → GaitResult         (name: "gait")
   ▼
 ReportBuilder
   └─ merged JSON → loguru structured log
@@ -53,23 +53,27 @@ ReportBuilder
 | Module | Library | Reason |
 |---|---|---|
 | ROS bag parsing | `rosbags` | Pure Python, no ROS installation required |
-| Clarity score | OpenCV `Laplacian` variance + Tenengrad gradient | Pure OpenCV/NumPy, no PyTorch dependency |
+| Clarity score | OpenCV `Laplacian` variance + Tenengrad | Pure OpenCV/NumPy, no PyTorch dependency |
 | Continuity score | OpenCV `calcOpticalFlowFarneback` | Frame-to-frame optical flow, CPU-efficient |
-| Face detection | OpenCV DNN + YuNet `.onnx` model | CPU-friendly, uses already-declared OpenCV dependency |
-| Voice detection | `webrtcvad` | Lightweight voice activity detection, no ML runtime |
-| Gait detection | OpenCV DNN + MoveNet Lightning `.tflite` via `onnxruntime` | Avoids mediapipe's heavyweight install; ONNX export is ~3 MB |
-| Webhook server | `FastAPI` + `uvicorn` | Async, returns 200 immediately via BackgroundTasks |
+| Face detection | OpenCV DNN + YuNet `.onnx` (~400 KB) | CPU-friendly, uses already-declared OpenCV DNN module |
+| Voice detection | `webrtcvad` | Lightweight VAD; requires pre-framed PCM (see below) |
+| Gait detection | OpenCV `HOGDescriptor` (people detector) | Already a dependency; binary person-presence flag is sufficient; no extra model file |
+| Webhook server | `FastAPI` + `uvicorn` | Async, returns 200 immediately via `BackgroundTasks` |
 | Structured logging | `loguru` | Simple JSON output |
 
-**Note:** No PyTorch dependency anywhere. All ML inference goes through OpenCV DNN or `onnxruntime` (CPU wheel, ~10 MB).
+**No PyTorch dependency anywhere.** All ML inference uses OpenCV DNN (with bundled `.onnx` model files) or built-in OpenCV algorithms.
+
+**Gait detection rationale:** Full pose estimation (MoveNet) is over-engineered for a binary "human gait present" flag. OpenCV's HOG pedestrian detector identifies walking humans without requiring any additional model download or conversion.
 
 ---
 
 ## JSON Report Format
 
+### Normal path (all analyzers succeed)
+
 ```json
 {
-  "report_id": "uuid4",
+  "report_id": "550e8400-e29b-41d4-a716-446655440000",
   "source_file": "robot-data/session_001.bag",
   "minio_bucket": "robot-uploads",
   "analyzed_at": "2026-03-19T14:30:00Z",
@@ -78,12 +82,12 @@ ReportBuilder
     "clarity": {
       "score": 0.82,
       "method": "laplacian+tenengrad",
-      "detail": "mean_laplacian_variance=312.4, mean_tenengrad=1840.2"
+      "detail": {"mean_laplacian_variance": 312.4, "mean_tenengrad": 1840.2}
     },
     "continuity": {
       "score": 0.91,
       "method": "optical_flow",
-      "detail": "mean_flow_magnitude=3.2, discontinuity_frames=2"
+      "detail": {"mean_flow_magnitude": 3.2, "discontinuity_frames": 2}
     }
   },
   "sensitive_info": {
@@ -98,20 +102,36 @@ ReportBuilder
 }
 ```
 
-### Pass/Fail Rules
+### Error path (one analyzer fails, corrupt bag)
 
-`passed = true` if and only if ALL of:
-- `scores.clarity.score >= CLARITY_THRESHOLD`
-- `scores.continuity.score >= CONTINUITY_THRESHOLD`
-- `sensitive_info.has_face == false`
-- `sensitive_info.has_human_voice == false`
-- `sensitive_info.has_human_gait == false`
-
-Any analyzer that raises an exception: its output fields are set to `null` in the report, the analyzer name is appended to `analyzer_errors`, and the corresponding failure reason `"analyzer_error:<name>"` is appended to `failure_reasons`. A `null` field **never** silently passes — it always counts as a failure.
-
-Example with a failed gait detector:
+If BagExtractor fails entirely:
 ```json
 {
+  "report_id": "...",
+  "source_file": "robot-data/bad_file.bag",
+  "minio_bucket": "robot-uploads",
+  "analyzed_at": "2026-03-19T14:30:00Z",
+  "duration_seconds": null,
+  "scores": null,
+  "sensitive_info": null,
+  "analyzer_errors": ["bag_extraction"],
+  "passed": false,
+  "failure_reasons": ["analyzer_error:bag_extraction"]
+}
+```
+
+If a single analyzer fails (e.g., gait):
+```json
+{
+  "report_id": "...",
+  "source_file": "robot-data/session_001.bag",
+  "minio_bucket": "robot-uploads",
+  "analyzed_at": "2026-03-19T14:30:00Z",
+  "duration_seconds": 42.5,
+  "scores": {
+    "clarity": {"score": 0.82, "method": "laplacian+tenengrad", "detail": {...}},
+    "continuity": {"score": 0.91, "method": "optical_flow", "detail": {...}}
+  },
   "sensitive_info": {
     "has_face": false,
     "face_count": 0,
@@ -124,6 +144,21 @@ Example with a failed gait detector:
 }
 ```
 
+**`detail` fields are structured objects** (not free-form strings) to allow log aggregators to parse individual metrics.
+
+### Pass/Fail Rules
+
+`passed = true` if and only if ALL of:
+- `duration_seconds >= MINIMUM_DURATION_SECONDS` (default: 1.0)
+- `scores.clarity.score >= CLARITY_THRESHOLD`
+- `scores.continuity.score >= CONTINUITY_THRESHOLD`
+- `sensitive_info.has_face == false`
+- `sensitive_info.has_human_voice == false`
+- `sensitive_info.has_human_gait == false`
+- `analyzer_errors` is empty
+
+Any `null` score or sensitive info field (from an analyzer error) always counts as a failure. A `null` field **never** silently passes.
+
 ---
 
 ## Analyzer Interface
@@ -134,43 +169,57 @@ Example with a failed gait detector:
 from typing import Protocol, TypedDict
 import numpy as np
 
+
 class ExtractedData(TypedDict):
-    frames: list[np.ndarray]          # BGR frames, HxWxC uint8
-    audio_wav: bytes | None           # raw PCM bytes, 16kHz mono int16
-    sensor_series: dict[str, np.ndarray]  # topic_name → (T, D) float array
+    frames: list[np.ndarray]           # BGR frames HxWxC uint8; may be empty list
+    audio_frames: list[bytes] | None   # 30ms PCM chunks, 16kHz mono int16; None if no audio topic
+    sensor_series: dict[str, np.ndarray]  # topic_name → (T, D) float64 array
+    duration_seconds: float            # total bag duration
+
 
 class ClarityResult(TypedDict):
-    score: float                      # [0, 1]
-    method: str
-    detail: str
+    score: float                       # [0.0, 1.0]
+    method: str                        # "laplacian+tenengrad"
+    detail: dict                       # {"mean_laplacian_variance": float, "mean_tenengrad": float}
+
 
 class ContinuityResult(TypedDict):
-    score: float                      # [0, 1]
-    method: str
-    detail: str
+    score: float                       # [0.0, 1.0]
+    method: str                        # "optical_flow"
+    detail: dict                       # {"mean_flow_magnitude": float, "discontinuity_frames": int}
+
 
 class FaceResult(TypedDict):
     has_face: bool
     face_count: int
 
+
 class VoiceResult(TypedDict):
     has_human_voice: bool
+
 
 class GaitResult(TypedDict):
     has_human_gait: bool
 
+
 class Analyzer(Protocol):
     def name(self) -> str:
-        """Returns the key used to store this analyzer's result in the pipeline output dict."""
+        """Canonical key used by ReportBuilder to place this result in the report.
+        Required values: "clarity" | "continuity" | "face" | "voice" | "gait"
+        """
         ...
+
     def analyze(self, data: ExtractedData) -> ClarityResult | ContinuityResult | FaceResult | VoiceResult | GaitResult:
+        """Analyze the extracted data and return a typed result dict.
+        Must handle empty frames list (return score=0.0 or has_*=False with analyzer_error).
+        Must not raise — exceptions are caught by AnalysisPipeline.
+        """
         ...
 ```
 
-`AnalysisPipeline` uses `analyzer.name()` as the key when collecting results:
-```python
-results = {analyzer.name(): future.result() for analyzer, future in futures.items()}
-```
+**PCM framing contract:** `BagExtractor` is responsible for chunking the raw audio bytes from the bag into 30 ms frames (480 samples at 16kHz × 2 bytes = 960 bytes each) before populating `audio_frames`. `VoiceDetector` passes these frames directly to `webrtcvad` without further chunking.
+
+**Empty frames handling:** When `frames` is an empty list, `ClarityAnalyzer` and `ContinuityAnalyzer` return `score=0.0` with `detail` indicating zero frames. `GaitDetector` and `FaceDetector` return `False` (no person detected in zero frames). These are valid results, not errors — `passed` will be `false` due to low scores but `analyzer_errors` will be empty.
 
 ---
 
@@ -180,32 +229,33 @@ results = {analyzer.name(): future.result() for analyzer, future in futures.item
 data-quality-agent/
 ├── agent/
 │   ├── __init__.py
-│   ├── main.py              # FastAPI app, /notify endpoint
+│   ├── main.py              # FastAPI app: POST /notify endpoint + BackgroundTasks
 │   ├── config.py            # pydantic-settings env config
-│   ├── extractor.py         # BagExtractor: parses .bag, yields ExtractedData
-│   ├── pipeline.py          # AnalysisPipeline: ThreadPoolExecutor over analyzers
+│   ├── extractor.py         # BagExtractor: parses .bag → ExtractedData (with PCM framing)
+│   ├── pipeline.py          # AnalysisPipeline: ThreadPoolExecutor over Analyzer list
 │   ├── report.py            # ReportBuilder: merges results → JSON log
 │   └── analyzers/
 │       ├── __init__.py
 │       ├── base.py          # Analyzer Protocol + all TypedDicts
-│       ├── clarity.py       # ClarityAnalyzer (Laplacian + Tenengrad)
-│       ├── continuity.py    # ContinuityAnalyzer (optical flow)
-│       ├── face.py          # FaceDetector (OpenCV DNN + YuNet)
-│       ├── voice.py         # VoiceDetector (webrtcvad)
-│       └── gait.py          # GaitDetector (onnxruntime + MoveNet)
+│       ├── clarity.py       # ClarityAnalyzer (name: "clarity")
+│       ├── continuity.py    # ContinuityAnalyzer (name: "continuity")
+│       ├── face.py          # FaceDetector (name: "face", OpenCV DNN + YuNet)
+│       ├── voice.py         # VoiceDetector (name: "voice", webrtcvad)
+│       └── gait.py          # GaitDetector (name: "gait", OpenCV HOG)
 ├── tests/
+│   ├── conftest.py          # Shared fixtures: synthetic ExtractedData, frames, PCM bytes
 │   ├── test_extractor.py
 │   ├── test_pipeline.py
-│   ├── test_report.py       # Tests pass/fail logic, null handling, failure_reasons
+│   ├── test_report.py       # Pass/fail logic, null handling, failure_reasons, report_id uniqueness, analyzed_at format
+│   ├── test_main.py         # POST /notify returns 200 immediately; BackgroundTask is enqueued
 │   └── analyzers/
 │       ├── test_clarity.py
 │       ├── test_continuity.py
 │       ├── test_face.py
 │       ├── test_voice.py
 │       └── test_gait.py
-├── models/                  # Pre-downloaded ONNX/TFLITE model files
-│   ├── yunet.onnx
-│   └── movenet_lightning.onnx
+├── models/
+│   └── yunet.onnx           # YuNet face detection model (~400 KB, bundled in repo)
 ├── pyproject.toml
 ├── Dockerfile
 └── docker-compose.yml
@@ -215,33 +265,62 @@ data-quality-agent/
 
 ## Deployment
 
-**docker-compose.yml** runs two services: `minio` and `agent`.
+### docker-compose.yml Structure
 
-### MinIO Webhook Configuration
+```yaml
+services:
+  minio:
+    image: minio/minio
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+      # Pre-register the webhook endpoint so mc event add can reference the ARN
+      MINIO_NOTIFY_WEBHOOK_ENABLE_agent: "on"
+      MINIO_NOTIFY_WEBHOOK_ENDPOINT_agent: "http://agent:8000/notify"
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
 
-MinIO requires environment variables to pre-register the webhook endpoint before `mc event add` can reference it. Required MinIO env vars:
+  minio-init:
+    image: minio/mc
+    depends_on:
+      minio:
+        condition: service_healthy
+      agent:
+        condition: service_healthy   # wait for agent to be ready before registering events
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set myminio http://minio:9000 minioadmin minioadmin &&
+        mc mb --ignore-existing myminio/robot-uploads &&
+        mc event add myminio/robot-uploads arn:minio:sqs::agent:webhook --event s3:ObjectCreated:*
+      "
 
-```env
-MINIO_NOTIFY_WEBHOOK_ENABLE_agent=on
-MINIO_NOTIFY_WEBHOOK_ENDPOINT_agent=http://agent:8000/notify
-MINIO_NOTIFY_WEBHOOK_AUTH_TOKEN_agent=   # empty = no auth, set if needed
+  agent:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      MINIO_BUCKET: robot-uploads
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
 ```
 
-After MinIO starts, an init container / entrypoint script runs:
+**Startup sequencing:** `minio-init` depends on both `minio` and `agent` being healthy before registering the bucket event. This prevents lost events at startup. The agent exposes `GET /health` (returns 200) for the healthcheck.
 
-```bash
-mc alias set myminio http://minio:9000 $MINIO_ROOT_USER $MINIO_ROOT_PASSWORD
-mc mb --ignore-existing myminio/$MINIO_BUCKET
-mc event add myminio/$MINIO_BUCKET arn:minio:sqs::agent:webhook --event s3:ObjectCreated:*
-```
+**ARN format:** `arn:minio:sqs::<alias>:webhook` where `<alias>` is the suffix of `MINIO_NOTIFY_WEBHOOK_ENABLE_<alias>` (`agent` in this case).
 
-The ARN format is `arn:minio:sqs::<alias>:webhook` where `<alias>` matches the suffix of `MINIO_NOTIFY_WEBHOOK_ENABLE_<alias>`.
+**Auth token:** `MINIO_NOTIFY_WEBHOOK_AUTH_TOKEN_agent` is left unset (no auth) for local development. If set, the agent must validate the `Authorization: Bearer <token>` header in `POST /notify` using a corresponding `WEBHOOK_AUTH_TOKEN` env var. The FastAPI endpoint checks this header and returns 401 if it does not match.
 
-### Agent Endpoint Behavior
-
-`POST /notify` immediately returns HTTP 200 and enqueues processing via FastAPI `BackgroundTasks`. This prevents MinIO from retrying on timeout.
-
-### Environment Variables (Agent)
+### Agent Environment Variables
 
 | Variable | Default | Description |
 |---|---|---|
@@ -251,24 +330,41 @@ The ARN format is `arn:minio:sqs::<alias>:webhook` where `<alias>` matches the s
 | `MINIO_BUCKET` | `robot-uploads` | Bucket to watch |
 | `CLARITY_THRESHOLD` | `0.6` | Min passing clarity score |
 | `CONTINUITY_THRESHOLD` | `0.6` | Min passing continuity score |
+| `MINIMUM_DURATION_SECONDS` | `1.0` | Min bag duration to be considered valid |
+| `WEBHOOK_AUTH_TOKEN` | `""` | If non-empty, validate Bearer token on /notify |
+| `MODEL_DIR` | `/app/models` | Directory containing bundled model files |
 | `LOG_LEVEL` | `INFO` | Log verbosity |
-| `MODEL_DIR` | `/app/models` | Directory containing ONNX model files |
 
 ---
 
 ## Error Handling
 
-- **Corrupt / unreadable bag file:** `BagExtractor` logs error with `source_file`, skips analysis entirely. No report emitted.
-- **Missing camera/audio topic:** `BagExtractor` sets the corresponding field to `None` / empty list. Analyzers that require the missing data return a null result with `analyzer_error:<name>` in `failure_reasons`.
-- **Analyzer exception:** Caught by `AnalysisPipeline`. Result set to `null`, analyzer name added to `analyzer_errors`, `failure_reasons` gets `"analyzer_error:<name>"`. Other analyzers continue.
-- **Temp file cleanup:** `tempfile.TemporaryDirectory` used as context manager; cleaned up on exit regardless of success or failure.
+| Failure | Behavior |
+|---|---|
+| Corrupt / unreadable bag | `BagExtractor` raises; a structured error report is emitted to log (`scores: null`, `sensitive_info: null`, `analyzer_errors: ["bag_extraction"]`, `passed: false`). Temp dir cleaned up. |
+| MinIO download failure | Caught in `BackgroundTask`. Structured error log emitted with `source_file` and exception message. No report fields populated. |
+| Single analyzer raises | Caught by `AnalysisPipeline`. Field set to `null`, name appended to `analyzer_errors`, `"analyzer_error:<name>"` in `failure_reasons`. Other analyzers continue. |
+| Camera topic missing / empty frames | `frames = []`. Analyzers return `score=0.0` or `has_*=False`. Valid result, not an error — bag fails due to low score. |
+| Audio topic missing | `audio_frames = None`. `VoiceDetector` returns `has_human_voice=False`. Valid result. |
+| Invalid webhook auth token | `POST /notify` returns HTTP 401. No processing. |
+
+**Temp file cleanup:** `tempfile.TemporaryDirectory` used as context manager in `BackgroundTask`; cleaned up on exit regardless of success or failure.
 
 ---
 
 ## Testing Strategy
 
-- **Unit tests per analyzer:** Synthetic data only (small `np.ndarray` frames, synthetic PCM bytes). No MinIO, no real bag files.
-- **`test_report.py`:** Tests `ReportBuilder` pass/fail logic, `null` field handling, `failure_reasons` population, and JSON output format correctness.
-- **`test_pipeline.py`:** Runs full pipeline with a minimal synthetic bag file; verifies all analyzer results are collected and errors are handled gracefully.
-- **`test_extractor.py`:** Tests `BagExtractor` with a minimal real or synthetic `.bag` file.
-- No external services required for any test.
+| Test file | What it covers |
+|---|---|
+| `conftest.py` | Synthetic `ExtractedData` fixture (small BGR frames, synthetic PCM frames, empty sensor dict), shared across all tests |
+| `test_main.py` | `POST /notify` returns 200 immediately; background task enqueued; `GET /health` returns 200; 401 on bad auth token |
+| `test_extractor.py` | BagExtractor with a minimal synthetic bag; PCM chunking produces 30ms frames |
+| `test_pipeline.py` | Full pipeline with synthetic data; analyzer errors are caught and do not abort other analyzers |
+| `test_report.py` | Pass/fail logic; all null fields produce `passed=false`; `report_id` is a valid UUID4 and unique per call; `analyzed_at` is ISO 8601 UTC; `failure_reasons` populated correctly |
+| `analyzers/test_clarity.py` | Score on sharp vs. blurry synthetic frames; empty frames → score=0.0 |
+| `analyzers/test_continuity.py` | Score on smooth vs. jumpy frame sequence; empty frames → score=0.0 |
+| `analyzers/test_face.py` | No-face frames → `has_face=False`; empty frames → `has_face=False` |
+| `analyzers/test_voice.py` | Silent PCM → `False`; `None` audio → `False` |
+| `analyzers/test_gait.py` | Empty frames → `has_human_gait=False` |
+
+No external services required for any test.
