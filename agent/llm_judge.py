@@ -1,0 +1,190 @@
+from __future__ import annotations
+import base64
+import json
+import cv2
+import numpy as np
+import anthropic
+from agent.analyzers.base import ExtractedData
+
+_SYSTEM_PROMPT = """You are a data quality judge for robot-collected MCAP recordings.
+
+You have access to algorithmic detector results and tools to inspect key frames and IMU data.
+
+Your job:
+1. Review any flagged sensitive information (face/voice/gait). Use get_key_frames to verify
+   whether detections are genuine (live human) or false positives (poster, screen, background noise).
+2. For borderline quality scores (within the review margin of threshold), review key frames and
+   IMU context to determine if degradation is expected (e.g. motion blur during fast maneuver).
+3. Produce a final verdict and a concise narrative (2-4 sentences in Chinese).
+
+Rules:
+- If a tool call fails, treat the original detector result as authoritative.
+- Do not override clear failures (score < 0.3, unambiguous live face). Only reconsider ambiguous cases.
+- Respond with valid JSON: {"passed": bool, "overrode_detector": bool, "override_detail": str | null, "narrative": str, "frames_reviewed": [int], "imu_windows_reviewed": [[float, float]]}
+"""
+
+
+def should_invoke_llm(
+    detector_results: dict,
+    clarity_threshold: float,
+    continuity_threshold: float,
+    margin: float,
+) -> bool:
+    """Return True if LLM review is warranted."""
+    face = detector_results.get("face") or {}
+    voice = detector_results.get("voice") or {}
+    gait = detector_results.get("gait") or {}
+    clarity = detector_results.get("clarity") or {}
+    continuity = detector_results.get("continuity") or {}
+
+    if face.get("has_face"):
+        return True
+    if gait.get("has_human_gait"):
+        return True
+    if voice.get("has_human_voice") and not face.get("has_face") and not gait.get("has_human_gait"):
+        return True  # cross-modal ambiguity
+
+    clarity_score = clarity.get("score")
+    if clarity_score is not None and abs(clarity_score - clarity_threshold) <= margin:
+        return True
+    continuity_score = continuity.get("score")
+    if continuity_score is not None and abs(continuity_score - continuity_threshold) <= margin:
+        return True
+
+    return False
+
+
+class LLMJudge:
+    def __init__(
+        self,
+        api_key: str,
+        model: str,
+        clarity_threshold: float,
+        continuity_threshold: float,
+        margin: float,
+    ) -> None:
+        self._api_key = api_key
+        self._model = model
+        self._clarity_threshold = clarity_threshold
+        self._continuity_threshold = continuity_threshold
+        self._margin = margin
+
+    def judge(
+        self,
+        detector_results: dict,
+        data: ExtractedData,
+    ) -> tuple[dict | None, str | None]:
+        """Run LLM judgment if warranted.
+
+        Returns (assessment_dict, error_name):
+          - (dict, None)  → LLM ran successfully
+          - (None, None)  → LLM skipped (not warranted)
+          - (None, "llm") → LLM failed; caller uses detector fallback
+        """
+        if not should_invoke_llm(
+            detector_results, self._clarity_threshold, self._continuity_threshold, self._margin
+        ):
+            return None, None
+
+        try:
+            return self._run_agent(detector_results, data), None
+        except Exception:
+            return None, "llm"
+
+    def _run_agent(self, detector_results: dict, data: ExtractedData) -> dict:
+        client = anthropic.Anthropic(api_key=self._api_key)
+        frames = data["frames"]
+        imu = data["sensor_series"]
+
+        tools = [
+            {
+                "name": "get_key_frames",
+                "description": "Returns base64-encoded JPEG images for the specified frame indices.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "frame_indices": {"type": "array", "items": {"type": "integer"}}
+                    },
+                    "required": ["frame_indices"],
+                },
+            },
+            {
+                "name": "get_imu_summary",
+                "description": "Returns IMU summary stats for a time window (seconds).",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "window_start": {"type": "number"},
+                        "window_end": {"type": "number"},
+                    },
+                    "required": ["window_start", "window_end"],
+                },
+            },
+        ]
+
+        user_message = (
+            f"Detector results:\n{json.dumps(detector_results, ensure_ascii=False, indent=2)}\n\n"
+            "Please review the flagged detections and/or borderline scores, "
+            "then respond with your JSON verdict."
+        )
+        messages = [{"role": "user", "content": user_message}]
+
+        for _ in range(5):  # max tool-use rounds
+            response = client.messages.create(
+                model=self._model,
+                max_tokens=1024,
+                system=_SYSTEM_PROMPT,
+                tools=tools,
+                messages=messages,
+            )
+
+            if response.stop_reason != "tool_use":
+                # Extract text response
+                text = next(
+                    (b.text for b in response.content if hasattr(b, "text")), "{}"
+                )
+                return json.loads(text)
+
+            # Process tool calls and append results
+            tool_results = []
+            for block in response.content:
+                if block.type != "tool_use":
+                    continue
+                result_content = self._dispatch_tool(block.name, block.input, frames, imu)
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": result_content,
+                })
+
+            messages.append({"role": "assistant", "content": response.content})
+            messages.append({"role": "user", "content": tool_results})
+
+        raise RuntimeError("LLM agent exceeded max tool-use rounds")
+
+    def _dispatch_tool(self, name: str, inputs: dict, frames: list, imu: dict) -> str:
+        if name == "get_key_frames":
+            indices = inputs.get("frame_indices", [])
+            result = []
+            for idx in indices:
+                if 0 <= idx < len(frames):
+                    _, buf = cv2.imencode(".jpg", frames[idx], [cv2.IMWRITE_JPEG_QUALITY, 70])
+                    result.append({
+                        "frame_index": idx,
+                        "image_b64": base64.b64encode(buf.tobytes()).decode(),
+                    })
+            return json.dumps(result)
+
+        elif name == "get_imu_summary":
+            # Simplified: return overall stats regardless of window
+            for key, arr in imu.items():
+                if arr.shape[1] >= 3:
+                    acc = arr[:, :3]
+                    return json.dumps({
+                        "mean_acceleration": float(np.linalg.norm(acc, axis=1).mean()),
+                        "max_angular_velocity": float(np.abs(arr[:, 3:6]).max()) if arr.shape[1] >= 6 else 0.0,
+                        "mean_angular_velocity": float(np.abs(arr[:, 3:6]).mean()) if arr.shape[1] >= 6 else 0.0,
+                    })
+            return json.dumps({"mean_acceleration": 0.0, "max_angular_velocity": 0.0, "mean_angular_velocity": 0.0})
+
+        return json.dumps({"error": f"unknown tool: {name}"})
