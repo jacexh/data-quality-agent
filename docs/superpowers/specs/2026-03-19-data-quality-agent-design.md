@@ -102,6 +102,24 @@ ReportBuilder
 }
 ```
 
+### Error path (MinIO download failure)
+
+If the `.bag` file cannot be downloaded (network error, file deleted, credential failure):
+```json
+{
+  "report_id": "550e8400-e29b-41d4-a716-446655440001",
+  "source_file": "robot-data/session_001.bag",
+  "minio_bucket": "robot-uploads",
+  "analyzed_at": "2026-03-19T14:30:00Z",
+  "duration_seconds": null,
+  "scores": null,
+  "sensitive_info": null,
+  "analyzer_errors": ["minio_download"],
+  "passed": false,
+  "failure_reasons": ["analyzer_error:minio_download"]
+}
+```
+
 ### Error path (one analyzer fails, corrupt bag)
 
 If BagExtractor fails entirely:
@@ -177,16 +195,28 @@ class ExtractedData(TypedDict):
     duration_seconds: float            # total bag duration
 
 
+class ClarityDetail(TypedDict):
+    mean_laplacian_variance: float     # higher = sharper
+    mean_tenengrad: float              # higher = sharper
+    frame_count: int                   # 0 when frames is empty
+
+
+class ContinuityDetail(TypedDict):
+    mean_flow_magnitude: float         # average optical flow magnitude across frame pairs
+    discontinuity_frames: int          # number of frames where flow exceeds discontinuity threshold
+    frame_count: int                   # 0 when frames is empty
+
+
 class ClarityResult(TypedDict):
     score: float                       # [0.0, 1.0]
     method: str                        # "laplacian+tenengrad"
-    detail: dict                       # {"mean_laplacian_variance": float, "mean_tenengrad": float}
+    detail: ClarityDetail
 
 
 class ContinuityResult(TypedDict):
     score: float                       # [0.0, 1.0]
     method: str                        # "optical_flow"
-    detail: dict                       # {"mean_flow_magnitude": float, "discontinuity_frames": int}
+    detail: ContinuityDetail
 
 
 class FaceResult(TypedDict):
@@ -219,7 +249,9 @@ class Analyzer(Protocol):
 
 **PCM framing contract:** `BagExtractor` is responsible for chunking the raw audio bytes from the bag into 30 ms frames (480 samples at 16kHz × 2 bytes = 960 bytes each) before populating `audio_frames`. `VoiceDetector` passes these frames directly to `webrtcvad` without further chunking.
 
-**Empty frames handling:** When `frames` is an empty list, `ClarityAnalyzer` and `ContinuityAnalyzer` return `score=0.0` with `detail` indicating zero frames. `GaitDetector` and `FaceDetector` return `False` (no person detected in zero frames). These are valid results, not errors — `passed` will be `false` due to low scores but `analyzer_errors` will be empty.
+**Empty frames handling:** When `frames` is an empty list, `ClarityAnalyzer` and `ContinuityAnalyzer` return `score=0.0` with `detail.frame_count=0`. `GaitDetector` and `FaceDetector` return `False`. These are valid results, not errors — `passed` will be `false` due to low scores but `analyzer_errors` will be empty.
+
+**No camera topic:** If the bag has no camera topic at all, `BagExtractor` sets `frames=[]`. The bag will fail on `clarity` and `continuity` scores (both 0.0 < threshold). This is by design — the agent is intended for robot data that includes video; bags without a camera topic are expected to fail quality checks. No special `"no_camera_topic"` failure reason is emitted; `failure_reasons` will include `"clarity"` and `"continuity"`.
 
 ---
 
@@ -320,6 +352,20 @@ services:
 
 **Auth token:** `MINIO_NOTIFY_WEBHOOK_AUTH_TOKEN_agent` is left unset (no auth) for local development. If set, the agent must validate the `Authorization: Bearer <token>` header in `POST /notify` using a corresponding `WEBHOOK_AUTH_TOKEN` env var. The FastAPI endpoint checks this header and returns 401 if it does not match.
 
+### Dockerfile (key lines)
+
+```dockerfile
+FROM python:3.12-slim
+WORKDIR /app
+COPY pyproject.toml .
+RUN pip install uv && uv pip install --system .
+COPY agent/ ./agent/
+COPY models/ ./models/          # bundles yunet.onnx into /app/models/
+CMD ["uvicorn", "agent.main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+The `models/` directory is copied into `/app/models/` at build time. `MODEL_DIR` defaults to `/app/models` and must match this path.
+
 ### Agent Environment Variables
 
 | Variable | Default | Description |
@@ -342,7 +388,7 @@ services:
 | Failure | Behavior |
 |---|---|
 | Corrupt / unreadable bag | `BagExtractor` raises; a structured error report is emitted to log (`scores: null`, `sensitive_info: null`, `analyzer_errors: ["bag_extraction"]`, `passed: false`). Temp dir cleaned up. |
-| MinIO download failure | Caught in `BackgroundTask`. Structured error log emitted with `source_file` and exception message. No report fields populated. |
+| MinIO download failure | Caught in `BackgroundTask`. Structured error report emitted (all fields as per "MinIO download failure" JSON example above). `analyzer_errors: ["minio_download"]`, `passed: false`. |
 | Single analyzer raises | Caught by `AnalysisPipeline`. Field set to `null`, name appended to `analyzer_errors`, `"analyzer_error:<name>"` in `failure_reasons`. Other analyzers continue. |
 | Camera topic missing / empty frames | `frames = []`. Analyzers return `score=0.0` or `has_*=False`. Valid result, not an error — bag fails due to low score. |
 | Audio topic missing | `audio_frames = None`. `VoiceDetector` returns `has_human_voice=False`. Valid result. |
@@ -356,7 +402,7 @@ services:
 
 | Test file | What it covers |
 |---|---|
-| `conftest.py` | Synthetic `ExtractedData` fixture (small BGR frames, synthetic PCM frames, empty sensor dict), shared across all tests |
+| `conftest.py` | Synthetic `ExtractedData` fixture: small BGR frames (4×4 px), synthetic 30ms PCM frame bytes, `sensor_series: {}` (no sensor analyzers in current scope); shared across all test files |
 | `test_main.py` | `POST /notify` returns 200 immediately; background task enqueued; `GET /health` returns 200; 401 on bad auth token |
 | `test_extractor.py` | BagExtractor with a minimal synthetic bag; PCM chunking produces 30ms frames |
 | `test_pipeline.py` | Full pipeline with synthetic data; analyzer errors are caught and do not abort other analyzers |
