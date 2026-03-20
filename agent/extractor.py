@@ -2,7 +2,13 @@ from __future__ import annotations
 import numpy as np
 from agent.analyzers.base import ExtractedData
 
+
 _PCM_FRAME_BYTES = 960  # 30ms × 16000Hz × 2 bytes (int16) = 960
+
+try:
+    from mcap_ros2.reader import read_ros2_messages
+except ImportError:
+    read_ros2_messages = None  # type: ignore[assignment]
 
 
 def chunk_pcm(raw: bytes) -> list[bytes]:
@@ -16,10 +22,12 @@ class McapExtractor:
         camera_topic: str = "/camera/image_raw",
         audio_topic: str = "/audio/data",
         imu_topic: str = "/imu/data",
+        frame_sample_rate: int = 1,
     ) -> None:
         self._camera_topic = camera_topic
         self._audio_topic = audio_topic
         self._imu_topic = imu_topic
+        self._frame_sample_rate = max(1, frame_sample_rate)
 
     def extract(self, mcap_path: str) -> ExtractedData:
         """Parse an MCAP file and return ExtractedData.
@@ -28,14 +36,12 @@ class McapExtractor:
         Audio is decoded from audio_common_msgs/AudioData messages and chunked to 30ms PCM frames.
         IMU is accumulated from sensor_msgs/Imu messages.
         """
-        frames: list[np.ndarray] = []
+        raw_frames: list[np.ndarray] = []
         raw_audio = b""
         imu_rows: list[np.ndarray] = []
         timestamps: list[float] = []
 
-        try:
-            from mcap_ros2.reader import read_ros2_messages
-        except ImportError:
+        if read_ros2_messages is None:
             raise RuntimeError("mcap-ros2-support not installed")
 
         try:
@@ -49,7 +55,7 @@ class McapExtractor:
                 if topic == self._camera_topic:
                     frame = self._decode_image(msg.ros_msg)
                     if frame is not None:
-                        frames.append(frame)
+                        raw_frames.append(frame)
 
                 elif topic == self._audio_topic:
                     chunk = self._decode_audio(msg.ros_msg)
@@ -63,6 +69,14 @@ class McapExtractor:
         except Exception:
             # Gracefully handle empty or malformed MCAP files
             pass
+
+        # Apply frame sampling: take every Nth frame, always keep at least 1 if any exist
+        if raw_frames:
+            frames = raw_frames[::self._frame_sample_rate]
+            if not frames:
+                frames = [raw_frames[0]]
+        else:
+            frames = []
 
         duration = (max(timestamps) - min(timestamps)) if len(timestamps) >= 2 else 0.0
         audio_frames = chunk_pcm(raw_audio) if raw_audio else None
