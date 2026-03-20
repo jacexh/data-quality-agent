@@ -184,6 +184,7 @@ def _make_summary(encodings: list[str]):
     channels = {}
     for i, enc in enumerate(encodings):
         ch = MagicMock()
+        ch.message_encoding = enc
         ch.metadata = {"encoding": enc}
         channels[i] = ch
     summary = MagicMock()
@@ -252,7 +253,8 @@ def test_detect_encodings_none_summary_fallback():
     from agent.mcap_codecs import ProtocolReaderFactory
     from mcap.records import Channel
 
-    channel = MagicMock(spec=Channel)
+    channel = MagicMock()
+    channel.message_encoding = ""
     channel.metadata = {"encoding": "ros1msg"}
 
     mock_reader = MagicMock()
