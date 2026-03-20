@@ -152,6 +152,7 @@ class ProtocolReaderFactory:
                     if enc:
                         raw_encodings.add(enc)
 
+        # raw_encodings is a plain set of strings — safe to use after file is closed
         protocols: set[str] = set()
         for enc in raw_encodings:
             protocol = _ENCODING_MAP.get(enc)

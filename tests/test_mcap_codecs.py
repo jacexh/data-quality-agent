@@ -186,14 +186,22 @@ def _make_summary(encodings: list[str]):
 
 
 def _patch_open_and_reader(mock_reader):
-    """Return a context manager stack that patches both open() and make_reader."""
-    from unittest.mock import patch, MagicMock
-    mock_file = MagicMock()
-    mock_file.__enter__ = lambda s: s
-    mock_file.__exit__ = MagicMock(return_value=False)
-    open_patch = patch("builtins.open", return_value=mock_file)
-    reader_patch = patch("agent.mcap_codecs.make_reader", return_value=mock_reader)
-    return open_patch, reader_patch
+    """Patch open() (intercepting only 'fake.mcap') and make_reader."""
+    import builtins
+    real_open = builtins.open
+
+    def selective_open(path, *args, **kwargs):
+        if path == "fake.mcap":
+            mock_file = MagicMock()
+            mock_file.__enter__ = MagicMock(return_value=mock_file)
+            mock_file.__exit__ = MagicMock(return_value=False)
+            return mock_file
+        return real_open(path, *args, **kwargs)
+
+    return (
+        patch("builtins.open", side_effect=selective_open),
+        patch("agent.mcap_codecs.make_reader", return_value=mock_reader),
+    )
 
 
 def test_detect_encodings_ros1():
@@ -229,6 +237,8 @@ def test_detect_encodings_unknown_emits_warning(caplog):
         with patch("agent.mcap_codecs.logger") as mock_logger:
             ProtocolReaderFactory._detect_encodings("fake.mcap")
             mock_logger.warning.assert_called_once()
+            call_args = mock_logger.warning.call_args[0]
+            assert "exotic_proto" in str(call_args)
 
 
 def test_detect_encodings_none_summary_fallback():
