@@ -11,41 +11,10 @@ from botocore.client import Config
 import boto3
 
 from agent.config import settings
-from agent.extractor import McapExtractor
-from agent.pipeline import AnalysisPipeline
-from agent.llm_judge import LLMJudge
-from agent.report import ReportBuilder
-from agent.analyzers.clarity import ClarityAnalyzer
-from agent.analyzers.continuity import ContinuityAnalyzer
-from agent.analyzers.face import FaceDetector
-from agent.analyzers.voice import VoiceDetector
-from agent.analyzers.gait import GaitDetector
-
-
-# ── Module-level singletons ────────────────────────────────────────────────
-
-_extractor = McapExtractor(frame_sample_rate=settings.frame_sample_rate)
-
-model_path = os.path.join(settings.model_dir, "yunet.onnx")
-if not os.path.exists(model_path):
-    model_path = os.path.join(os.getcwd(), "models", "yunet.onnx")
-
-_pipeline = AnalysisPipeline(analyzers=[
-    ClarityAnalyzer(),
-    ContinuityAnalyzer(),
-    FaceDetector(model_path=model_path),
-    VoiceDetector(),
-    GaitDetector(),
-])
-_judge = LLMJudge(
-    api_key=settings.anthropic_api_key,
-    model=settings.llm_model,
-    clarity_threshold=settings.clarity_threshold,
-    continuity_threshold=settings.continuity_threshold,
-    margin=settings.llm_review_margin,
-    base_url=settings.anthropic_base_url,
+from agent.runner import (
+    _extractor, _pipeline, _judge, _builder,
+    analyze_local_file,
 )
-_builder = ReportBuilder(settings)
 
 _queue: asyncio.Queue[tuple[str, str]] = asyncio.Queue(maxsize=settings.max_queue_size)
 _processing: set[str] = set()
@@ -168,24 +137,6 @@ def _process_and_log(s3_client, bucket: str, key: str) -> None:
 
 
 def _analyze_and_log(source_file: str, bucket: str, local_path: str) -> None:
-    try:
-        data = _extractor.extract(local_path)
-    except Exception:
-        report = _builder.build(
-            source_file=source_file, bucket=bucket,
-            detector_results={}, detector_errors=["mcap_extraction"],
-            llm_assessment=None, llm_error=None, duration_seconds=None,
-        )
-        logger.error(json.dumps(report))
-        return
-
-    detector_results, detector_errors = _pipeline.run(data)
-    llm_assessment, llm_error = _judge.judge(detector_results, data)
-    report = _builder.build(
-        source_file=source_file, bucket=bucket,
-        detector_results=detector_results, detector_errors=detector_errors,
-        llm_assessment=llm_assessment, llm_error=llm_error,
-        duration_seconds=data["duration_seconds"],
-    )
+    report = analyze_local_file(local_path, source_file=source_file, bucket=bucket)
     level = "WARNING" if not report["passed"] else "INFO"
     logger.log(level, json.dumps(report, ensure_ascii=False))
