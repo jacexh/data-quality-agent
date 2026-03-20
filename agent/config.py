@@ -22,5 +22,9 @@ class Settings(BaseSettings):
     model_dir: str = "/app/models"
     log_level: str = "INFO"
 
+    max_queue_size: int = 100
+    worker_count: int = 4
+    frame_sample_rate: int = 30
+
 
 settings = Settings()
