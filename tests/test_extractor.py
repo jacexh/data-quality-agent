@@ -192,3 +192,38 @@ def test_imu_data_accumulated():
         data = extractor.extract("fake.mcap")
     assert "/imu/data" in data["sensor_series"]
     assert data["sensor_series"]["/imu/data"].shape == (3, 6)
+
+
+# ── _safe_iter ────────────────────────────────────────────────────────────────
+
+def test_safe_iter_skips_decoder_not_found_error():
+    """Messages that raise DecoderNotFoundError are skipped; iteration continues."""
+    from mcap.exceptions import DecoderNotFoundError
+    from agent.extractor import _safe_iter
+
+    good1 = ("schema1", "channel1", "msg1", "decoded1")
+    good2 = ("schema2", "channel2", "msg2", "decoded2")
+
+    call_count = 0
+
+    class _FakeIterator:
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return good1
+            elif call_count == 2:
+                raise DecoderNotFoundError("no decoder for encoding 'xyz'")
+            elif call_count == 3:
+                return good2
+            else:
+                raise StopIteration
+
+    mock_reader = MagicMock()
+    mock_reader.iter_decoded_messages.return_value = _FakeIterator()
+
+    results = list(_safe_iter(mock_reader, ["/camera/image_raw"]))
+    assert results == [good1, good2]

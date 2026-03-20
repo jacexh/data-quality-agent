@@ -1,5 +1,6 @@
 # agent/extractor.py
 from __future__ import annotations
+from typing import Any, Iterator
 import numpy as np
 from loguru import logger
 from mcap.reader import make_reader
@@ -20,8 +21,7 @@ def chunk_pcm(raw: bytes) -> list[bytes]:
     return [raw[i:i + _PCM_FRAME_BYTES] for i in range(0, len(raw) - _PCM_FRAME_BYTES + 1, _PCM_FRAME_BYTES)]
 
 
-
-def _safe_iter(reader, topics: list[str]):
+def _safe_iter(reader: Any, topics: list[str]) -> Iterator[tuple]:
     """Wrap iter_decoded_messages to skip messages that raise DecoderNotFoundError."""
     it = reader.iter_decoded_messages(topics=topics)
     while True:
