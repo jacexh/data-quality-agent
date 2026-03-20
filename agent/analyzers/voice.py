@@ -15,13 +15,18 @@ class VoiceDetector:
     def analyze(self, data: ExtractedData) -> VoiceResult:
         audio_frames = data["audio_frames"]
         if not audio_frames:
-            return VoiceResult(has_human_voice=False)
+            return VoiceResult(has_human_voice=False, speech_frame_ratio=0.0)
 
+        speech_count = 0
         for frame in audio_frames:
             try:
                 if self._vad.is_speech(frame, _SAMPLE_RATE):
-                    return VoiceResult(has_human_voice=True)
+                    speech_count += 1
             except Exception:
                 continue
 
-        return VoiceResult(has_human_voice=False)
+        speech_frame_ratio = speech_count / len(audio_frames)
+        return VoiceResult(
+            has_human_voice=speech_count > 0,
+            speech_frame_ratio=round(speech_frame_ratio, 4),
+        )

@@ -25,14 +25,29 @@ class FaceDetector:
     def analyze(self, data: ExtractedData) -> FaceResult:
         frames = data["frames"]
         if not frames:
-            return FaceResult(has_face=False, face_count=0)
+            return FaceResult(has_face=False, face_count=0, face_frame_ratio=0.0, max_confidence=0.0)
 
         max_faces = 0
+        max_confidence = 0.0
+        frames_with_face = 0
+
         for frame in frames:
             h, w = frame.shape[:2]
             detector = self._get_detector(w, h)
             _, detections = detector.detect(frame)
-            count = len(detections) if detections is not None else 0
-            max_faces = max(max_faces, count)
+            if detections is not None and len(detections) > 0:
+                count = len(detections)
+                max_faces = max(max_faces, count)
+                frames_with_face += 1
+                # YuNet detection columns: [x,y,w,h, landmarks×10, confidence]
+                frame_max_conf = float(detections[:, -1].max())
+                max_confidence = max(max_confidence, frame_max_conf)
 
-        return FaceResult(has_face=max_faces > 0, face_count=max_faces)
+        face_frame_ratio = frames_with_face / len(frames)
+
+        return FaceResult(
+            has_face=max_faces > 0,
+            face_count=max_faces,
+            face_frame_ratio=round(face_frame_ratio, 4),
+            max_confidence=round(max_confidence, 4),
+        )
