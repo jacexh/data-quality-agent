@@ -113,11 +113,9 @@ async def test_processing_key_removed_after_worker_completes():
     _processing.add("test.mcap")
     await _queue.put(("bucket", "test.mcap"))
 
-    # Run one iteration of the worker
     with patch("agent.main._process_and_log", side_effect=RuntimeError("boom")):
-        # The worker loops forever; run it for one item using a task with timeout
         task = asyncio.create_task(_worker(mock_client))
-        await asyncio.sleep(0.05)  # allow one loop iteration
+        await _queue.join()  # wait until task_done() is called (reliable sync point)
         task.cancel()
         try:
             await task
