@@ -1,3 +1,4 @@
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -22,9 +23,9 @@ class Settings(BaseSettings):
     model_dir: str = "/app/models"
     log_level: str = "INFO"
 
-    max_queue_size: int = 100
-    worker_count: int = 4
-    frame_sample_rate: int = 30
+    max_queue_size: int = Field(default=100, gt=0)
+    worker_count: int = Field(default=4, gt=0)
+    frame_sample_rate: int = Field(default=30, gt=0)
 
 
 settings = Settings()
