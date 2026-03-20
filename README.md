@@ -2,7 +2,7 @@
 
 机器人传感器数据（MCAP 文件）自动质量评估系统。
 
-MinIO 存储桶上传触发 webhook → 下载 MCAP → 并发算法检测 → LLM 裁决（按需）→ JSON 质量报告。
+MinIO 存储桶上传触发 webhook → 有界队列 + 多 worker 并发下载 → 帧采样提取 → 并发算法检测 → LLM 裁决（按需）→ JSON 质量报告。
 
 ## 功能概览
 
@@ -37,10 +37,14 @@ agent/
 ```
 MinIO S3 事件
     └─→ POST /notify
-            └─→ McapExtractor（提取帧/音频/IMU）
-                    └─→ AnalysisPipeline（5 个检测器并发）
-                            └─→ LLMJudge（按需调用 Claude）
-                                    └─→ ReportBuilder → loguru JSON 输出
+            ├─→ 重复检测（_processing set）→ 200 duplicate
+            ├─→ 队列已满（asyncio.Queue）→ 429 queue_full
+            └─→ 入队成功 → 200 accepted
+                    └─→ Worker（per-worker S3 客户端，asyncio.to_thread）
+                            └─→ McapExtractor（帧采样 + 音频提取）
+                                    └─→ AnalysisPipeline（5 个检测器并发）
+                                            └─→ LLMJudge（按需调用 Claude）
+                                                    └─→ ReportBuilder → loguru JSON 输出
 ```
 
 ## 快速开始
@@ -68,19 +72,24 @@ uv run uvicorn agent.main:app --reload
 ### Docker 完整栈（推荐）
 
 ```bash
-# 启动 MinIO + Agent
+# 启动 MinIO + nginx + Agent（单实例）
 docker-compose up --build
+
+# 水平扩容（多 Agent 实例，nginx 自动负载均衡）
+docker compose up --build --scale agent=4
 
 # 停止
 docker-compose down
 ```
 
 启动后：
-- Agent API：`http://localhost:8000`
+- Agent API（经由 nginx）：`http://localhost:8000`
 - MinIO 控制台：`http://localhost:9001`（账号 `minioadmin` / `minioadmin`）
 - MinIO S3 API：`http://localhost:9000`
 
 上传 `.mcap` 文件到 `robot-uploads` 存储桶即可自动触发质量评估。
+
+> **水平扩容说明：** 每个 Agent 实例持有独立的有界队列和 worker 池，nginx 以轮询方式将请求分发到各实例；若某实例队列已满（返回 429），nginx 自动重试其他实例（`proxy_next_upstream http_429`）。
 
 ## 环境变量
 
@@ -101,6 +110,9 @@ docker-compose down
 | `WEBHOOK_AUTH_TOKEN` | _(可选)_ | webhook Bearer Token 鉴权 |
 | `LLM_MODEL` | `claude-sonnet-4-6` | 使用的 Claude 模型 |
 | `LOG_LEVEL` | `INFO` | 日志级别 |
+| `MAX_QUEUE_SIZE` | `100` | 每实例有界队列容量，超出返回 429 |
+| `WORKER_COUNT` | `4` | 每实例并发 worker 数量 |
+| `FRAME_SAMPLE_RATE` | `30` | 视觉检测帧采样率（每 N 帧取 1 帧） |
 
 ## API
 
@@ -114,7 +126,7 @@ docker-compose down
 
 ### `POST /notify`
 
-接收 MinIO S3 事件通知。非 `.mcap` 文件将被忽略，分析在后台异步执行。
+接收 MinIO S3 事件通知。非 `.mcap` 文件将被忽略，任务入队后异步处理。
 
 **请求体（MinIO 标准格式）：**
 
@@ -131,9 +143,13 @@ docker-compose down
 
 **响应：**
 
-```json
-{"status": "accepted"}
-```
+| 状态码 | body | 含义 |
+|--------|------|------|
+| `200` | `{"status": "accepted"}` | 任务已入队 |
+| `200` | `{"status": "ignored"}` | 非 mcap 文件，跳过 |
+| `200` | `{"status": "duplicate"}` | 该文件正在处理中，跳过 |
+| `429` | `{"status": "queue_full"}` | 队列已满，请稍后重试 |
+| `401` | — | Token 鉴权失败 |
 
 ## 质量报告
 
