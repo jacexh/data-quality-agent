@@ -11,10 +11,7 @@ from botocore.client import Config
 import boto3
 
 from agent.config import settings
-from agent.runner import (
-    _extractor, _pipeline, _judge, _builder,
-    analyze_local_file,
-)
+from agent.runner import _builder, analyze_local_file
 
 _queue: asyncio.Queue[tuple[str, str]] = asyncio.Queue(maxsize=settings.max_queue_size)
 _processing: set[str] = set()
