@@ -15,5 +15,12 @@ def test_none_audio_no_voice(empty_data):
     assert result["has_human_voice"] is False
 
 
+def test_speech_band_audio_detected(speech_data):
+    """1 kHz sine wave (speech frequency band) must be detected as voice (positive recall test)."""
+    detector = VoiceDetector()
+    result = detector.analyze(speech_data)
+    assert result["has_human_voice"] is True
+
+
 def test_name():
     assert VoiceDetector().name() == "voice"

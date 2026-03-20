@@ -18,5 +18,13 @@ def test_uniform_frame_no_face(blurry_data):
     assert result["has_face"] is False
 
 
+def test_real_face_detected(face_data):
+    """lena.jpg contains one face — YuNet must detect it (positive recall test)."""
+    detector = FaceDetector(model_path="models/yunet.onnx")
+    result = detector.analyze(face_data)
+    assert result["has_face"] is True
+    assert result["face_count"] >= 1
+
+
 def test_name():
     assert FaceDetector(model_path="models/yunet.onnx").name() == "face"

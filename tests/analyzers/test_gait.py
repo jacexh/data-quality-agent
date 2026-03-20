@@ -14,5 +14,12 @@ def test_small_uniform_frames_no_gait(blurry_data):
     assert result["has_human_gait"] is False
 
 
+def test_real_person_detected(person_data):
+    """Street photo with pedestrian — HOG must detect at least one person (positive recall test)."""
+    detector = GaitDetector()
+    result = detector.analyze(person_data)
+    assert result["has_human_gait"] is True
+
+
 def test_name():
     assert GaitDetector().name() == "gait"
