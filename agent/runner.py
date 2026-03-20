@@ -1,6 +1,7 @@
 # agent/runner.py
 from __future__ import annotations
 import os
+from loguru import logger
 from agent.config import settings
 from agent.extractor import McapExtractor
 from agent.pipeline import AnalysisPipeline
@@ -45,7 +46,8 @@ def analyze_local_file(local_path: str, source_file: str = "", bucket: str = "")
     src = source_file or local_path
     try:
         data = _extractor.extract(local_path)
-    except Exception:
+    except Exception as exc:
+        logger.error("MCAP extraction failed for {!r}: {}", local_path, exc)
         return _builder.build(
             source_file=src, bucket=bucket,
             detector_results={}, detector_errors=["mcap_extraction"],

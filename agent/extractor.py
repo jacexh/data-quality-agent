@@ -48,18 +48,55 @@ class McapExtractor:
         self._frame_sample_rate = max(1, frame_sample_rate)
         self._registry = registry if registry is not None else build_default_registry()
 
+    def _resolve_topics(self, mcap_path: str) -> tuple[str, str, str]:
+        """Return (camera_topic, audio_topic, imu_topic), auto-detecting camera topic if needed."""
+        with open(mcap_path, "rb") as f:
+            reader = make_reader(f)
+            summary = reader.get_summary()
+            channels = list(summary.channels.values()) if summary else []
+
+        _IMAGE_SCHEMAS = {"sensor_msgs/Image", "sensor_msgs/CompressedImage"}
+        _AUDIO_SCHEMAS = {"audio_common_msgs/AudioData"}
+        _IMU_SCHEMAS   = {"sensor_msgs/Imu"}
+
+        configured_topics = {self._camera_topic, self._audio_topic, self._imu_topic}
+        available_topics  = {ch.topic for ch in channels}
+
+        camera_topic = self._camera_topic
+        audio_topic  = self._audio_topic
+        imu_topic    = self._imu_topic
+
+        if camera_topic not in available_topics:
+            # Fall back to first image topic found in the file
+            for ch in channels:
+                schema_id = ch.schema_id
+                if summary:
+                    schema = summary.schemas.get(schema_id)
+                    schema_name = schema.name if schema else ""
+                    if schema_name in _IMAGE_SCHEMAS:
+                        camera_topic = ch.topic
+                        logger.info(
+                            "camera_topic {!r} not found; using {!r} instead",
+                            self._camera_topic, camera_topic,
+                        )
+                        break
+
+        return camera_topic, audio_topic, imu_topic
+
     def extract(self, mcap_path: str) -> ExtractedData:
         """Parse an MCAP file and return ExtractedData.
 
         Auto-detects ROS1/ROS2 encoding. Handles both sensor_msgs/Image and
         sensor_msgs/CompressedImage. Audio and IMU extraction unchanged.
+        Falls back to first available image topic if configured topic is absent.
         """
         raw_frames: list[np.ndarray] = []
         _audio_buf = bytearray()
         imu_rows: list[np.ndarray] = []
         timestamps: list[float] = []
 
-        topics = [self._camera_topic, self._audio_topic, self._imu_topic]
+        camera_topic, audio_topic, imu_topic = self._resolve_topics(mcap_path)
+        topics = [camera_topic, audio_topic, imu_topic]
         decoder_factories = ProtocolReaderFactory.build_decoder_factories(mcap_path)
         with open(mcap_path, "rb") as f:
             reader = make_reader(f, decoder_factories=decoder_factories)
@@ -68,17 +105,17 @@ class McapExtractor:
                 timestamps.append(t)
                 topic = channel.topic
 
-                if topic == self._camera_topic:
+                if topic == camera_topic:
                     frame = self._registry.decode_image(schema.name, decoded_message)
                     if frame is not None:
                         raw_frames.append(frame)
 
-                elif topic == self._audio_topic:
+                elif topic == audio_topic:
                     chunk = self._registry.decode_audio(schema.name, decoded_message)
                     if chunk:
                         _audio_buf.extend(chunk)
 
-                elif topic == self._imu_topic:
+                elif topic == imu_topic:
                     row = self._registry.decode_imu(schema.name, decoded_message)
                     if row is not None:
                         imu_rows.append(row)

@@ -113,10 +113,14 @@ def build_default_registry() -> SchemaDecoderRegistry:
 
 # ── ProtocolReaderFactory ────────────────────────────────────────────────────
 
-# Encoding strings found in MCAP channel metadata → logical protocol name
+# Encoding strings found in MCAP channel message_encoding field → logical protocol name
+# Handles both legacy metadata["encoding"] style ("ros1msg", "cdr") and
+# newer message_encoding field style ("ros1", "ros2").
 _ENCODING_MAP: dict[str, str] = {
     "ros1msg": "ros1",
+    "ros1":    "ros1",
     "cdr":     "ros2",
+    "ros2":    "ros2",
 }
 
 _SUPPORTED: set[str] = {"ros1", "ros2"}
@@ -149,13 +153,13 @@ class ProtocolReaderFactory:
             if summary is not None:
                 raw_encodings = {
                     enc for ch in summary.channels.values()
-                    if (enc := ch.metadata.get("encoding", ""))
+                    if (enc := (ch.message_encoding or ch.metadata.get("encoding", "")))
                 }
             else:
                 # Unindexed / streaming-written file — scan Channel records
                 raw_encodings = set()
                 for item in reader.iter_messages():
-                    enc = item.channel.metadata.get("encoding", "")
+                    enc = item.channel.message_encoding or item.channel.metadata.get("encoding", "")
                     if enc:
                         raw_encodings.add(enc)
 
