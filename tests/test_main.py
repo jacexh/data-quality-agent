@@ -78,6 +78,19 @@ async def test_notify_returns_401_on_bad_token():
         settings.webhook_auth_token = original
 
 
+async def test_notify_returns_401_when_no_auth_header():
+    """Missing Authorization header (not just wrong token) must also return 401."""
+    from agent.config import settings
+    original = settings.webhook_auth_token
+    settings.webhook_auth_token = "secret"
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            response = await c.post("/notify", json=_mcap_payload())  # no Authorization header
+        assert response.status_code == 401
+    finally:
+        settings.webhook_auth_token = original
+
+
 # ── New behavior ──────────────────────────────────────────────────────────────
 
 async def test_notify_returns_429_when_queue_full(client):

@@ -22,5 +22,14 @@ def test_speech_band_audio_detected(speech_data):
     assert result["has_human_voice"] is True
 
 
+def test_empty_audio_frames_list_no_voice():
+    """Empty list [] (distinct from None) — falsy, must also return no voice."""
+    from agent.analyzers.base import ExtractedData
+    data = ExtractedData(frames=[], audio_frames=[], sensor_series={}, duration_seconds=0.0)
+    detector = VoiceDetector()
+    result = detector.analyze(data)
+    assert result["has_human_voice"] is False
+
+
 def test_name():
     assert VoiceDetector().name() == "voice"

@@ -21,5 +21,16 @@ def test_real_person_detected(person_data):
     assert result["has_human_gait"] is True
 
 
+def test_all_frames_below_minimum_size_no_crash():
+    """All frames below HOG minimum 128×64 → skipped, returns False without crashing (spec contract)."""
+    import numpy as np
+    from agent.analyzers.base import ExtractedData
+    tiny = np.zeros((32, 32, 3), dtype=np.uint8)
+    data = ExtractedData(frames=[tiny, tiny], audio_frames=None, sensor_series={}, duration_seconds=1.0)
+    detector = GaitDetector()
+    result = detector.analyze(data)
+    assert result["has_human_gait"] is False
+
+
 def test_name():
     assert GaitDetector().name() == "gait"
