@@ -41,8 +41,9 @@ ProtocolReaderFactory.from_file(path)
     │
     ▼
 reader.iter_decoded_messages(topics=[...])
-    │  Yields (schema, channel, message, ros_msg)
+    │  Yields (schema, channel, message, decoded_message)
     │  Protocol differences transparent to caller
+    │  DecoderNotFoundError caught per-message → logger.warning + skip
     │
     ▼
 SchemaDecoderRegistry
@@ -81,24 +82,31 @@ tests/
 
 ```python
 class ProtocolReaderFactory:
-    _SUPPORTED = {"ros1", "ros2", "cdr"}
+    _SUPPORTED = {"ros1", "ros2"}
 
     @classmethod
-    def from_file(cls, path: str) -> McapReader:
-        """Detect encodings, build decoder factories, return configured reader."""
+    def build_decoder_factories(cls, path: str) -> list:
+        """Detect encodings from file metadata, return list of DecoderFactory instances."""
 
     @classmethod
     def _detect_encodings(cls, path: str) -> set[str]:
-        """Read summary index only (no message scan). Log warning for unsupported encodings."""
+        """Read summary index only (no message scan). Log warning for unsupported encodings.
+        Falls back to scanning Channel records if get_summary() returns None (unindexed files)."""
 
     @classmethod
-    def _build_decoder_factories(cls, encodings: set[str]) -> list:
+    def _build_factories_for(cls, encodings: set[str]) -> list:
         """Lazily import mcap_ros1/mcap_ros2 DecoderFactory based on detected encodings."""
 ```
 
-- `_detect_encodings` reads `summary.channels` only — O(1) index read, not a full message scan
-- Unknown encodings emit `logger.warning` and are skipped (partial reads allowed)
-- `from mcap_ros1.decoder import DecoderFactory` imported lazily to avoid hard dependency when not needed
+- `"cdr"` removed from `_SUPPORTED` — CDR is not a decodable protocol in this version; files
+  with CDR-encoded channels will emit `logger.warning` like any other unsupported encoding
+- `_detect_encodings` reads `summary.channels` — O(1) index read, not a full message scan
+- If `get_summary()` returns `None` (unindexed / streaming-written file), fall back to scanning
+  `iter_messages()` for `Channel` records using a **separate file handle** — the `NonSeekingReader`
+  used for unindexed files is single-use (`_spent` flag), so the scan and main read must not share a handle
+- Unknown encodings emit `logger.warning` and are excluded from the supported set
+- `from mcap_ros1.decoder import DecoderFactory` and `from mcap_ros2.decoder import DecoderFactory`
+  imported lazily — both available via `mcap-ros1-support` and `mcap-ros2-support`
 
 ### `SchemaDecoderRegistry`
 
@@ -118,13 +126,15 @@ class SchemaDecoderRegistry:
 ```
 
 - Returns `None` / `b""` for unregistered schemas (no exception)
+- `decode_audio` returns `bytes` (never `None`) — empty bytes are safe for the PCM pipeline;
+  `decode_image` and `decode_imu` return `T | None` because `None` is the skip signal downstream
 - `build_default_registry() -> SchemaDecoderRegistry` pre-registers all built-in decoders
 
 ### Built-in Decode Functions (module-level, pure)
 
 | Function | Schema | Notes |
 |---|---|---|
-| `_decode_raw_image` | `sensor_msgs/Image` | Handles rgb/bgr encoding, reshapes buffer |
+| `_decode_raw_image` | `sensor_msgs/Image` | Handles rgb/bgr encoding, reshapes buffer; mono8 not supported (logs debug) |
 | `_decode_compressed_image` | `sensor_msgs/CompressedImage` | `cv2.imdecode` → BGR |
 | `_decode_audio` | `audio_common_msgs/AudioData` | Returns raw bytes |
 | `_decode_imu` | `sensor_msgs/Imu` | 6-element float64 array |
@@ -151,13 +161,50 @@ class McapExtractor:
 - Internal `_decode_image/_decode_audio/_decode_imu` private methods removed; logic lives in `mcap_codecs.py`
 - Frame sampling, PCM chunking, duration calculation logic unchanged
 
+**File handle and `DecoderNotFoundError` handling in `extract`:**
+
+`extract` owns the file handle and the safe-iteration adapter. `DecoderNotFoundError` is raised
+inside the iterator's `__next__()` (inside `decoded_message()` closure in `mcap/reader.py`), so it
+cannot be caught inside the `for` loop body. A generator adapter is required:
+
+```python
+from mcap.exceptions import DecoderNotFoundError
+
+def _safe_iter(reader, topics):
+    """Wrap iter_decoded_messages to skip individual messages that lack a decoder."""
+    it = reader.iter_decoded_messages(topics=topics)
+    while True:
+        try:
+            yield next(it)
+        except DecoderNotFoundError as e:
+            logger.warning("No decoder for message encoding, skipping: {}", e)
+        except StopIteration:
+            return
+
+def extract(self, mcap_path: str) -> ExtractedData:
+    decoder_factories = ProtocolReaderFactory.build_decoder_factories(mcap_path)
+    with open(mcap_path, "rb") as f:
+        reader = make_reader(f, decoder_factories=decoder_factories)
+        for schema, channel, message, decoded_message in _safe_iter(reader, topics):
+            ...
+```
+
+`extract` itself opens the file with `with open(...)` so the handle is always closed. The factory
+method `build_decoder_factories` reads the file separately for encoding detection and returns only
+the factory list — it does not hold a file handle.
+
+Note: the fourth tuple field is `decoded_message` (the `DecodedMessageTuple` namedtuple field),
+not `ros_msg`. Test stubs must yield 4-tuples with `decoded_message` in position 3.
+
 ---
 
 ## Error Handling
 
 | Scenario | Behaviour |
 |---|---|
-| Unknown encoding in file | `logger.warning`, skip those channels, continue |
+| Unknown encoding detected at summary read | `logger.warning`, excluded from factory set |
+| `get_summary()` returns None (unindexed file) | Fall back to `iter_messages()` Channel scan via separate file handle |
+| `DecoderNotFoundError` during iteration | `logger.warning` per message via `_safe_iter` adapter, skip and continue |
 | Registered schema but malformed message | `logger.debug`, return `None`/`b""`, skip message |
 | Unregistered schema on matched topic | Return `None`/`b""`, no log (expected for unknown schemas) |
 | File not found / corrupt header | Exception propagates to `runner.analyze_local_file`, logged there |
@@ -171,12 +218,14 @@ class McapExtractor:
 - `_decode_compressed_image`: encode a synthetic JPEG, verify BGR shape returned
 - `_decode_raw_image`: construct minimal `SimpleNamespace` with height/width/data/encoding
 - `SchemaDecoderRegistry`: unknown schema returns `None`; custom decoder registered and called
-- `ProtocolReaderFactory._detect_encodings`: mock `make_reader` summary with known encodings
+- `ProtocolReaderFactory._detect_encodings`: mock `make_reader` summary with known encodings;
+  also test `None` summary fallback path
 
 ### `test_extractor.py` (updated)
 
 - Replace `read_ros2_messages` mock with `ProtocolReaderFactory.from_file` mock
-- Mock reader yields `(schema, channel, message, ros_msg)` 4-tuples
+- Mock reader's `iter_decoded_messages` yields `(schema, channel, message, decoded_message)` 4-tuples
+  where `decoded_message` is a `SimpleNamespace` with the fields each decode function expects
 - Frame sampling, PCM chunking, duration tests: update mock layer only, logic assertions unchanged
 - Inject minimal `SchemaDecoderRegistry` with only needed decoders per test
 
@@ -184,4 +233,7 @@ class McapExtractor:
 
 ## Dependencies
 
-No new packages required. `mcap_ros1` decoder is already present via `mcap-ros2-support` (the package bundles both). Lazy import avoids errors if ever run without it.
+`mcap-ros1-support>=0.4` added to `pyproject.toml` (previously missing; `mcap_ros1` is a separate
+package from `mcap-ros2-support`). Both packages are lazily imported inside
+`_build_decoder_factories` so an ImportError at that point surfaces a clear message rather than a
+top-level import failure.
