@@ -235,6 +235,34 @@ def test_llm_skipped_reason_set_when_all_clear():
     assert report["llm_skipped_reason"] == "all_detectors_clear_no_borderline_scores"
 
 
+def test_llm_skipped_reason_clear_failure_when_score_clearly_bad():
+    """Score clearly below threshold → LLM skipped, reason reflects clear failure."""
+    results = _good_results()
+    results["clarity"] = {"score": 0.2, "method": "laplacian+tenengrad", "detail": {}}
+    builder = ReportBuilder(_settings())
+    report = builder.build(
+        source_file="test.mcap", bucket="b",
+        detector_results=results, detector_errors=[],
+        llm_assessment=None, llm_error=None,
+        duration_seconds=5.0,
+    )
+    assert report["passed"] is False
+    assert report["llm_skipped_reason"] == "clear_failure_no_borderline_scores"
+
+
+def test_llm_skipped_reason_detector_error_on_extraction_failure():
+    """When extraction fails, llm_skipped_reason reflects detector error, not 'all clear'."""
+    builder = ReportBuilder(_settings())
+    report = builder.build(
+        source_file="test.mcap", bucket="b",
+        detector_results={}, detector_errors=["mcap_extraction"],
+        llm_assessment=None, llm_error=None,
+        duration_seconds=None,
+    )
+    assert report["passed"] is False
+    assert report["llm_skipped_reason"] == "detector_error_no_llm_review"
+
+
 def test_llm_skipped_reason_none_when_llm_ran():
     """When LLM ran (assessment present), llm_skipped_reason must be None."""
     results = _good_results()

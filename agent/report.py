@@ -92,7 +92,12 @@ class ReportBuilder:
 
         llm_skipped_reason = None
         if llm_assessment is None and llm_error is None:
-            llm_skipped_reason = "all_detectors_clear_no_borderline_scores"
+            if detector_errors:
+                llm_skipped_reason = "detector_error_no_llm_review"
+            elif failure_reasons:
+                llm_skipped_reason = "clear_failure_no_borderline_scores"
+            else:
+                llm_skipped_reason = "all_detectors_clear_no_borderline_scores"
 
         return {
             "report_id": str(uuid.uuid4()),
