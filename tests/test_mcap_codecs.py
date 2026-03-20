@@ -45,6 +45,12 @@ def test_decode_raw_image_missing_attr_returns_none():
     assert _decode_raw_image(SimpleNamespace()) is None
 
 
+def test_decode_raw_image_mono8_returns_none():
+    """mono8 (single-channel) encoding is not supported — returns None."""
+    msg = SimpleNamespace(height=4, width=4, encoding="mono8", data=bytes([128] * 16))
+    assert _decode_raw_image(msg) is None
+
+
 # ── _decode_compressed_image ─────────────────────────────────────────────────
 
 def test_decode_compressed_image_jpeg_returns_bgr():

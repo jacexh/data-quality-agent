@@ -14,12 +14,19 @@ ImuDecodeFn   = Callable[[Any], "np.ndarray | None"]
 # ── Built-in decode functions (module-level, pure) ───────────────────────────
 
 def _decode_raw_image(msg: Any) -> np.ndarray | None:
-    """Decode sensor_msgs/Image → BGR ndarray. Returns None on failure."""
+    """Decode sensor_msgs/Image → BGR ndarray. Returns None on failure.
+
+    Supports bgr8 and rgb8 encodings. mono8 and other single-channel encodings
+    are not supported and return None.
+    """
     try:
         h, w = msg.height, msg.width
         data = bytes(msg.data)
         encoding = getattr(msg, "encoding", "bgr8")
-        channels = 3 if "rgb" in encoding or "bgr" in encoding else 1
+        if "rgb" not in encoding and "bgr" not in encoding:
+            logger.debug("_decode_raw_image: unsupported encoding {:!r}, skipping", encoding)
+            return None
+        channels = 3
         arr = np.frombuffer(data, dtype=np.uint8).reshape(h, w, channels)
         if "rgb" in encoding:
             arr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
@@ -141,8 +148,8 @@ class ProtocolReaderFactory:
 
             if summary is not None:
                 raw_encodings = {
-                    ch.metadata.get("encoding", "")
-                    for ch in summary.channels.values()
+                    enc for ch in summary.channels.values()
+                    if (enc := ch.metadata.get("encoding", ""))
                 }
             else:
                 # Unindexed / streaming-written file — scan Channel records
