@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     minio_use_ssl: bool = False
 
     anthropic_api_key: str = ""
+    anthropic_base_url: str = ""
     llm_model: str = "claude-sonnet-4-6"
     llm_review_margin: float = 0.1
 

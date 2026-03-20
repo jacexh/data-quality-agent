@@ -100,6 +100,7 @@ docker-compose down
 | 变量名 | 默认值 | 说明 |
 |--------|--------|------|
 | `ANTHROPIC_API_KEY` | _(必填)_ | Claude API 密钥 |
+| `ANTHROPIC_BASE_URL` | _(空，使用官方地址)_ | Anthropic API 入口地址，可替换为代理或私有部署地址 |
 | `MINIO_ENDPOINT` | `minio:9000` | MinIO 服务地址 |
 | `MINIO_ACCESS_KEY` | `minioadmin` | MinIO 访问密钥 |
 | `MINIO_SECRET_KEY` | `minioadmin` | MinIO 秘密密钥 |

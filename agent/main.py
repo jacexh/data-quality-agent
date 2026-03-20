@@ -43,6 +43,7 @@ _judge = LLMJudge(
     clarity_threshold=settings.clarity_threshold,
     continuity_threshold=settings.continuity_threshold,
     margin=settings.llm_review_margin,
+    base_url=settings.anthropic_base_url,
 )
 _builder = ReportBuilder(settings)
 

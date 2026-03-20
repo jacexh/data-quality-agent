@@ -62,12 +62,14 @@ class LLMJudge:
         clarity_threshold: float,
         continuity_threshold: float,
         margin: float,
+        base_url: str = "",
     ) -> None:
         self._api_key = api_key
         self._model = model
         self._clarity_threshold = clarity_threshold
         self._continuity_threshold = continuity_threshold
         self._margin = margin
+        self._base_url = base_url
 
     def judge(
         self,
@@ -92,7 +94,10 @@ class LLMJudge:
             return None, "llm"
 
     def _run_agent(self, detector_results: dict, data: ExtractedData) -> dict:
-        client = anthropic.Anthropic(api_key=self._api_key)
+        client = anthropic.Anthropic(
+            api_key=self._api_key,
+            **({"base_url": self._base_url} if self._base_url else {}),
+        )
         frames = data["frames"]
         imu = data["sensor_series"]
 
