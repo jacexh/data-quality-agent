@@ -18,12 +18,12 @@ Your job:
    whether detections are genuine (live human) or false positives (poster, screen, background noise).
 2. For borderline quality scores (within the review margin of threshold), review key frames and
    IMU context to determine if degradation is expected (e.g. motion blur during fast maneuver).
-3. Produce a final verdict and a concise narrative (2-4 sentences in Chinese).
+3. Call submit_verdict with your final decision and a concise narrative (2-4 sentences in Chinese).
 
 Rules:
 - If a tool call fails, treat the original detector result as authoritative.
 - Do not override clear failures (score < 0.3, unambiguous live face). Only reconsider ambiguous cases.
-- Respond with valid JSON: {"passed": bool, "overrode_detector": bool, "override_detail": str | null, "narrative": str, "frames_reviewed": [int], "imu_windows_reviewed": [[float, float]]}
+- You MUST call submit_verdict to complete your review. Do not output free text as your final answer.
 """
 
 
@@ -140,12 +140,32 @@ class LLMJudge:
                     "required": ["window_start", "window_end"],
                 },
             },
+            {
+                "name": "submit_verdict",
+                "description": "Submit the final quality verdict. Must be called once all review is complete.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "passed": {"type": "boolean"},
+                        "overrode_detector": {"type": "boolean"},
+                        "override_detail": {"type": ["string", "null"]},
+                        "narrative": {"type": "string"},
+                        "frames_reviewed": {"type": "array", "items": {"type": "integer"}},
+                        "imu_windows_reviewed": {
+                            "type": "array",
+                            "items": {"type": "array", "items": {"type": "number"}},
+                        },
+                    },
+                    "required": ["passed", "overrode_detector", "override_detail", "narrative",
+                                 "frames_reviewed", "imu_windows_reviewed"],
+                },
+            },
         ]
 
         user_message = (
             f"Detector results:\n{json.dumps(detector_results, ensure_ascii=False, indent=2)}\n\n"
             "Please review the flagged detections and/or borderline scores, "
-            "then respond with your JSON verdict."
+            "then call submit_verdict with your final decision."
         )
         messages = [{"role": "user", "content": user_message}]
 
@@ -159,8 +179,22 @@ class LLMJudge:
                 timeout=60.0,
             )
 
+            # Process tool calls; return immediately on submit_verdict
+            tool_results: list[dict[str, Any]] = []
+            for block in response.content:
+                if block.type != "tool_use":
+                    continue
+                if block.name == "submit_verdict":
+                    return dict(block.input)
+                result_content = self._dispatch_tool(block.name, block.input, frames, imu)
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": result_content,
+                })
+
             if response.stop_reason != "tool_use":
-                # Extract text response
+                # Fallback: LLM stopped without calling submit_verdict — try to parse text as JSON
                 text = next(
                     (b.text for b in response.content if hasattr(b, "text")), "{}"
                 )
@@ -169,18 +203,6 @@ class LLMJudge:
                 except json.JSONDecodeError as exc:
                     logger.error("LLM returned invalid JSON: {}…", text[:200])
                     raise RuntimeError("LLM response was not valid JSON") from exc
-
-            # Process tool calls and append results
-            tool_results: list[dict[str, Any]] = []
-            for block in response.content:
-                if block.type != "tool_use":
-                    continue
-                result_content = self._dispatch_tool(block.name, block.input, frames, imu)
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": result_content,
-                })
 
             messages.append({"role": "assistant", "content": response.content})
             messages.append({"role": "user", "content": tool_results})
@@ -219,7 +241,7 @@ class LLMJudge:
             # Returns overall stats across all available IMU data.
             window_start = inputs.get("window_start")
             window_end = inputs.get("window_end")
-            for _imu_key, arr in imu.items():
+            for arr in imu.values():
                 if arr.shape[1] >= 3:
                     acc = arr[:, :3]
                     summary: dict[str, Any] = {

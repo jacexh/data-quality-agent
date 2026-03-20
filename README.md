@@ -222,6 +222,86 @@ LLM 可调用两个工具辅助判断：
 
 Claude API 异常时自动降级，仅使用检测器结果作为最终判定，不影响报告输出。
 
+### 报告样例
+
+```json
+{
+  "report_id": "0be1b8d7-39ae-440e-8b17-3edde1551a43",
+  "source_file": "data/20241203_demo_Office_PickPlace_ljw_152145.mcap",
+  "minio_bucket": "",
+  "analyzed_at": "2026-03-20T09:03:50Z",
+  "duration_seconds": 363.7240240573883,
+  "scores": {
+    "clarity": {
+      "score": 0.5171,
+      "method": "laplacian+fft",
+      "detail": {
+        "mean_laplacian_variance": 799.9532,
+        "fft_high_freq_ratio": 0.0051,
+        "frame_score_std": 0.0022,
+        "frame_count": 364
+      }
+    },
+    "continuity": {
+      "score": 0.5344,
+      "method": "optical_flow",
+      "detail": {
+        "mean_flow_magnitude": 2.256,
+        "flow_magnitude_std": 1.5424,
+        "flow_direction_std": 1.1585,
+        "discontinuity_frames": 169,
+        "frame_count": 364
+      }
+    }
+  },
+  "sensitive_info": {
+    "has_face": true,
+    "face_count": 2,
+    "has_human_voice": false,
+    "has_human_gait": true
+  },
+  "llm_assessment": {
+    "passed": true,
+    "overrode_detector": true,
+    "override_detail": "人脸检测（2张，最大置信度0.7684）和步态检测（person_frame_ratio=0.0082）均为误报：所有审查帧中均未发现真实的活体人脸或人体，画面内容为密集文本/文档图像，算法误将文字纹理识别为人脸和步态特征。清晰度（0.5171）和连续性（0.5344）分数处于边界值附近，但高拉普拉斯方差（799.95）表明图像实际清晰，低FFT高频比与文档类内容一致；IMU数据缺失，无法评估运动模糊，但无 证据表明质量下降源于传感器问题。",
+    "narrative": "经逐帧审查（共抽查17帧），所有画面均为密集文本/文档内容，未检测到任何真实活体人脸或人体步态；人脸与步态检测结果均为算法误报，由文字纹理触发。清晰度与连续性得分虽处于边界范围，但图像实际质量正常，IMU数据缺失排除了运动模糊的解释依据。综合判断，本次录制数据无真实敏感信息泄露风险，质量问题为假阳性，判定通过。",
+    "frames_reviewed": [
+      0,
+      20,
+      45,
+      60,
+      90,
+      100,
+      135,
+      150,
+      180,
+      200,
+      225,
+      250,
+      270,
+      300,
+      315,
+      340,
+      363
+    ],
+    "imu_windows_reviewed": [
+      [
+        0,
+        30
+      ],
+      [
+        30,
+        60
+      ]
+    ]
+  },
+  "llm_skipped_reason": null,
+  "analyzer_errors": [],
+  "passed": true,
+  "failure_reasons": []
+}
+```
+
 ## 测试
 
 ```bash
