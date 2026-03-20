@@ -4,4 +4,4 @@ __pycache__/
 .venv/
 *.egg-info/
 .env
-models/*.onnx
+# models/*.onnx  — yunet.onnx is intentionally committed (233 KB built-in, no runtime download)
