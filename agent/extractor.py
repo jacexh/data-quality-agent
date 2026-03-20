@@ -2,7 +2,7 @@
 from __future__ import annotations
 import numpy as np
 from loguru import logger
-from mcap.reader import make_reader as _mcap_make_reader
+from mcap.reader import make_reader
 from mcap.exceptions import DecoderNotFoundError
 from agent.analyzers.base import ExtractedData
 from agent.mcap_codecs import (
@@ -19,24 +19,6 @@ def chunk_pcm(raw: bytes) -> list[bytes]:
     """Split raw PCM bytes into 30ms frames (960 bytes each). Drops remainder."""
     return [raw[i:i + _PCM_FRAME_BYTES] for i in range(0, len(raw) - _PCM_FRAME_BYTES + 1, _PCM_FRAME_BYTES)]
 
-
-def make_reader(path: str, decoder_factories: list | None = None):
-    """Open an MCAP file by path and return an mcap Reader.
-
-    This thin wrapper keeps ``open()`` internal so tests can patch
-    ``agent.extractor.make_reader`` without needing to also patch
-    ``builtins.open``.  The caller is responsible for ensuring the returned
-    reader (and thus the underlying file) is fully consumed before the reader
-    goes out of scope; the mcap library buffers reads so the file handle is
-    only needed during iteration.
-
-    Note: the file is intentionally left open for the lifetime of the reader
-    because mcap reads lazily.  CPython's reference-counting GC will close it
-    when the reader is collected; in the rare case of a non-CPython runtime an
-    explicit ``del reader`` will release it promptly.
-    """
-    f = open(path, "rb")  # noqa: WPS515
-    return _mcap_make_reader(f, decoder_factories=decoder_factories or [])
 
 
 def _safe_iter(reader, topics: list[str]):
@@ -79,27 +61,27 @@ class McapExtractor:
 
         topics = [self._camera_topic, self._audio_topic, self._imu_topic]
         decoder_factories = ProtocolReaderFactory.build_decoder_factories(mcap_path)
-        reader = make_reader(mcap_path, decoder_factories=decoder_factories)
+        with open(mcap_path, "rb") as f:
+            reader = make_reader(f, decoder_factories=decoder_factories)
+            for schema, channel, message, decoded_message in _safe_iter(reader, topics):
+                t = message.log_time / 1e9
+                timestamps.append(t)
+                topic = channel.topic
 
-        for schema, channel, message, decoded_message in _safe_iter(reader, topics):
-            t = message.log_time / 1e9
-            timestamps.append(t)
-            topic = channel.topic
+                if topic == self._camera_topic:
+                    frame = self._registry.decode_image(schema.name, decoded_message)
+                    if frame is not None:
+                        raw_frames.append(frame)
 
-            if topic == self._camera_topic:
-                frame = self._registry.decode_image(schema.name, decoded_message)
-                if frame is not None:
-                    raw_frames.append(frame)
+                elif topic == self._audio_topic:
+                    chunk = self._registry.decode_audio(schema.name, decoded_message)
+                    if chunk:
+                        _audio_buf.extend(chunk)
 
-            elif topic == self._audio_topic:
-                chunk = self._registry.decode_audio(schema.name, decoded_message)
-                if chunk:
-                    _audio_buf.extend(chunk)
-
-            elif topic == self._imu_topic:
-                row = self._registry.decode_imu(schema.name, decoded_message)
-                if row is not None:
-                    imu_rows.append(row)
+                elif topic == self._imu_topic:
+                    row = self._registry.decode_imu(schema.name, decoded_message)
+                    if row is not None:
+                        imu_rows.append(row)
 
         # Apply frame sampling: keep every Nth frame, always keep at least 1 if any exist
         if raw_frames:

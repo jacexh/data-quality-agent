@@ -1,4 +1,5 @@
 # tests/test_extractor.py
+import builtins
 from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 import numpy as np
@@ -69,13 +70,24 @@ def _make_imu_tuple(topic: str, log_time_ns: int, decoded_msg) -> tuple:
 
 
 def _patch_extractor(tuples: list[tuple]):
-    """Patch ProtocolReaderFactory.build_decoder_factories and make_reader to
-    return an iterator over the supplied 4-tuples."""
+    """Patch open() (fake.mcap only), ProtocolReaderFactory.build_decoder_factories,
+    and make_reader to return an iterator over the supplied 4-tuples."""
     mock_reader = MagicMock()
     mock_reader.iter_decoded_messages.return_value = iter(tuples)
     mock_make_reader = MagicMock(return_value=mock_reader)
 
+    real_open = builtins.open
+
+    def selective_open(path, *args, **kwargs):
+        if path == "fake.mcap":
+            mock_file = MagicMock()
+            mock_file.__enter__ = MagicMock(return_value=mock_file)
+            mock_file.__exit__ = MagicMock(return_value=False)
+            return mock_file
+        return real_open(path, *args, **kwargs)
+
     return (
+        patch("builtins.open", side_effect=selective_open),
         patch("agent.extractor.ProtocolReaderFactory.build_decoder_factories", return_value=[]),
         patch("agent.extractor.make_reader", mock_make_reader),
     )
@@ -110,8 +122,8 @@ def test_frame_sample_rate_reduces_frame_count():
         for i in range(25)
     ]
     extractor = McapExtractor(frame_sample_rate=5, registry=reg)
-    p1, p2 = _patch_extractor(tuples)
-    with p1, p2:
+    p1, p2, p3 = _patch_extractor(tuples)
+    with p1, p2, p3:
         data = extractor.extract("fake.mcap")
     assert len(data["frames"]) == 5
 
@@ -124,8 +136,8 @@ def test_frame_sample_rate_1_returns_all_frames():
         for i in range(10)
     ]
     extractor = McapExtractor(frame_sample_rate=1, registry=reg)
-    p1, p2 = _patch_extractor(tuples)
-    with p1, p2:
+    p1, p2, p3 = _patch_extractor(tuples)
+    with p1, p2, p3:
         data = extractor.extract("fake.mcap")
     assert len(data["frames"]) == 10
 
@@ -138,8 +150,8 @@ def test_frame_sample_rate_larger_than_frame_count_returns_one_frame():
         for i in range(5)
     ]
     extractor = McapExtractor(frame_sample_rate=100, registry=reg)
-    p1, p2 = _patch_extractor(tuples)
-    with p1, p2:
+    p1, p2, p3 = _patch_extractor(tuples)
+    with p1, p2, p3:
         data = extractor.extract("fake.mcap")
     assert len(data["frames"]) >= 1
 
@@ -155,8 +167,8 @@ def test_audio_not_sampled_by_frame_sample_rate():
         for i in range(10)
     ]
     extractor = McapExtractor(frame_sample_rate=100, registry=reg)
-    p1, p2 = _patch_extractor(tuples)
-    with p1, p2:
+    p1, p2, p3 = _patch_extractor(tuples)
+    with p1, p2, p3:
         data = extractor.extract("fake.mcap")
     assert data["audio_frames"] is not None
     assert len(data["audio_frames"]) == 10
@@ -175,8 +187,8 @@ def test_imu_data_accumulated():
         for i in range(3)
     ]
     extractor = McapExtractor(registry=reg)
-    p1, p2 = _patch_extractor(tuples)
-    with p1, p2:
+    p1, p2, p3 = _patch_extractor(tuples)
+    with p1, p2, p3:
         data = extractor.extract("fake.mcap")
     assert "/imu/data" in data["sensor_series"]
     assert data["sensor_series"]["/imu/data"].shape == (3, 6)
