@@ -4,6 +4,8 @@ from agent.analyzers.base import ExtractedData, GaitResult
 
 
 class GaitDetector:
+    """Human gait detector using HOG + SVM people detector."""
+
     def __init__(self) -> None:
         self._hog = cv2.HOGDescriptor()
         self._hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())

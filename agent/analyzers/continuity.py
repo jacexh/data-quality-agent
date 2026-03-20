@@ -24,6 +24,8 @@ def _flow_stats(flow: np.ndarray) -> tuple[float, float]:
 
 
 class ContinuityAnalyzer:
+    """Temporal continuity analyzer using Farneback optical flow."""
+
     def name(self) -> str:
         return "continuity"
 

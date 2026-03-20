@@ -6,6 +6,10 @@ import sys
 
 
 def main() -> None:
+    """Entry point for ``agent-cli analyze <path.mcap>``.
+
+    Exits 0 on pass, 1 on fail, 2 on argument/file errors.
+    """
     args = sys.argv[1:]
 
     # Validate: must be "analyze <path>"

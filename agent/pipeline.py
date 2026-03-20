@@ -1,21 +1,24 @@
 from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any
 from agent.analyzers.base import Analyzer, ExtractedData
 
 
 class AnalysisPipeline:
+    """Runs all analyzers concurrently via a thread pool."""
+
     def __init__(self, analyzers: list[Analyzer], max_workers: int = 5) -> None:
         self._analyzers = analyzers
         self._max_workers = max_workers
 
-    def run(self, data: ExtractedData) -> tuple[dict, list[str]]:
+    def run(self, data: ExtractedData) -> tuple[dict[str, Any], list[str]]:
         """Run all analyzers concurrently.
 
         Returns:
             results: dict mapping analyzer.name() → result dict (or None on error)
             errors: list of analyzer names that raised
         """
-        results: dict = {}
+        results: dict[str, Any] = {}
         errors: list[str] = []
 
         with ThreadPoolExecutor(max_workers=self._max_workers) as executor:

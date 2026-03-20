@@ -30,6 +30,8 @@ def _frame_scores(gray: np.ndarray) -> tuple[float, float]:
 
 
 class ClarityAnalyzer:
+    """Image clarity analyzer using Laplacian variance and FFT high-frequency ratio."""
+
     def name(self) -> str:
         return "clarity"
 

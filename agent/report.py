@@ -1,10 +1,13 @@
 from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
+from typing import Any
 from agent.config import Settings
 
 
 class ReportBuilder:
+    """Merges detector and LLM results into a structured JSON report."""
+
     def __init__(self, settings: Settings) -> None:
         self._s = settings
 
@@ -12,12 +15,13 @@ class ReportBuilder:
         self,
         source_file: str,
         bucket: str,
-        detector_results: dict,
+        detector_results: dict[str, Any],
         detector_errors: list[str],
-        llm_assessment: dict | None,
+        llm_assessment: dict[str, Any] | None,
         llm_error: str | None,
         duration_seconds: float | None,
-    ) -> dict:
+    ) -> dict[str, Any]:
+        """Build the final report dict from pipeline outputs."""
         analyzer_errors = list(detector_errors)
         if llm_error:
             analyzer_errors.append(llm_error)

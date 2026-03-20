@@ -1,9 +1,12 @@
 from __future__ import annotations
 import base64
 import json
+from typing import Any
+
+import anthropic
 import cv2
 import numpy as np
-import anthropic
+from loguru import logger
 from agent.analyzers.base import ExtractedData
 
 _SYSTEM_PROMPT = """You are a data quality judge for robot-collected MCAP recordings.
@@ -25,12 +28,16 @@ Rules:
 
 
 def should_invoke_llm(
-    detector_results: dict,
+    detector_results: dict[str, Any],
     clarity_threshold: float,
     continuity_threshold: float,
     margin: float,
 ) -> bool:
-    """Return True if LLM review is warranted."""
+    """Return True if LLM review is warranted.
+
+    Triggers on: sensitive detections (face/voice/gait), cross-modal voice
+    ambiguity, or quality scores within ``margin`` of their thresholds.
+    """
     face = detector_results.get("face") or {}
     voice = detector_results.get("voice") or {}
     gait = detector_results.get("gait") or {}
@@ -55,6 +62,12 @@ def should_invoke_llm(
 
 
 class LLMJudge:
+    """Conditional LLM reviewer for borderline or sensitive detector results.
+
+    Wraps a Claude tool-use loop. Only invoked when ``should_invoke_llm``
+    returns True; falls back to detector results on any API error.
+    """
+
     def __init__(
         self,
         api_key: str,
@@ -73,9 +86,9 @@ class LLMJudge:
 
     def judge(
         self,
-        detector_results: dict,
+        detector_results: dict[str, Any],
         data: ExtractedData,
-    ) -> tuple[dict | None, str | None]:
+    ) -> tuple[dict[str, Any] | None, str | None]:
         """Run LLM judgment if warranted.
 
         Returns (assessment_dict, error_name):
@@ -90,10 +103,12 @@ class LLMJudge:
 
         try:
             return self._run_agent(detector_results, data), None
-        except Exception:
+        except Exception as exc:
+            logger.warning("LLM judge failed, falling back to detector results: {}", exc)
             return None, "llm"
 
-    def _run_agent(self, detector_results: dict, data: ExtractedData) -> dict:
+    def _run_agent(self, detector_results: dict[str, Any], data: ExtractedData) -> dict[str, Any]:
+        """Run the Claude tool-use agentic loop; raise on any error."""
         client = anthropic.Anthropic(
             api_key=self._api_key,
             **({"base_url": self._base_url} if self._base_url else {}),
@@ -151,7 +166,7 @@ class LLMJudge:
                 return json.loads(text)
 
             # Process tool calls and append results
-            tool_results = []
+            tool_results: list[dict[str, Any]] = []
             for block in response.content:
                 if block.type != "tool_use":
                     continue
@@ -167,7 +182,13 @@ class LLMJudge:
 
         raise RuntimeError("LLM agent exceeded max tool-use rounds")
 
-    def _dispatch_tool(self, name: str, inputs: dict, frames: list, imu: dict) -> str:
+    def _dispatch_tool(
+        self,
+        name: str,
+        inputs: dict[str, Any],
+        frames: list[np.ndarray],
+        imu: dict[str, np.ndarray],
+    ) -> str:
         if name == "get_key_frames":
             indices = inputs.get("frame_indices", [])
             result = []

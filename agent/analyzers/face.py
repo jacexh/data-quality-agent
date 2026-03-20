@@ -4,12 +4,14 @@ from agent.analyzers.base import ExtractedData, FaceResult
 
 
 class FaceDetector:
+    """Face detector using OpenCV's YuNet ONNX model."""
+
     def __init__(self, model_path: str = "models/yunet.onnx", conf_threshold: float = 0.6) -> None:
         self._model_path = model_path
         self._conf_threshold = conf_threshold
         self._detector = None  # lazy init — avoid loading on import
 
-    def _get_detector(self, width: int, height: int):
+    def _get_detector(self, width: int, height: int) -> cv2.FaceDetectorYN:
         detector = cv2.FaceDetectorYN.create(
             self._model_path,
             "",

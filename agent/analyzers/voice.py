@@ -6,6 +6,8 @@ _VAD_MODE = 2  # aggressiveness 0-3; 2 = balanced
 
 
 class VoiceDetector:
+    """Voice activity detector using WebRTC VAD."""
+
     def __init__(self, mode: int = _VAD_MODE) -> None:
         self._vad = webrtcvad.Vad(mode)
 

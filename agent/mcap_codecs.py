@@ -130,7 +130,7 @@ class ProtocolReaderFactory:
     """Detect MCAP file encoding and build matching mcap DecoderFactory instances."""
 
     @classmethod
-    def build_decoder_factories(cls, path: str) -> list:
+    def build_decoder_factories(cls, path: str) -> list[Any]:
         """Read file metadata, return a list of DecoderFactory instances.
 
         Opens and closes a file handle internally — does not retain one.
@@ -175,7 +175,7 @@ class ProtocolReaderFactory:
         return protocols
 
     @classmethod
-    def _build_factories_for(cls, encodings: set[str]) -> list:
+    def _build_factories_for(cls, encodings: set[str]) -> list[Any]:
         """Lazily import and instantiate DecoderFactory for each known protocol."""
         factories = []
         if "ros1" in encodings:

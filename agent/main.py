@@ -1,14 +1,16 @@
 from __future__ import annotations
 import asyncio
-import tempfile
-import os
 import json
+import os
+import tempfile
 from contextlib import asynccontextmanager
-from loguru import logger
+from typing import Any
+
+import boto3
+from botocore.client import Config
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from botocore.client import Config
-import boto3
+from loguru import logger
 
 from agent.config import settings
 from agent.runner import _builder, analyze_local_file
@@ -19,7 +21,7 @@ _processing: set[str] = set()
 
 # ── S3 client factory ──────────────────────────────────────────────────────
 
-def _make_s3_client():
+def _make_s3_client() -> Any:
     """Create a boto3 S3 client. Call once per worker — each worker owns its client."""
     return boto3.client(
         "s3",
@@ -32,7 +34,7 @@ def _make_s3_client():
 
 # ── Worker ─────────────────────────────────────────────────────────────────
 
-async def _worker(s3_client) -> None:
+async def _worker(s3_client: Any) -> None:
     """Consume jobs from _queue. Each worker owns its S3 client exclusively."""
     while True:
         bucket, key = await _queue.get()
@@ -74,16 +76,18 @@ def _check_auth(request: Request) -> None:
 # ── Routes ─────────────────────────────────────────────────────────────────
 
 @app.get("/health")
-async def health():
+async def health() -> dict[str, str]:
+    """Return service health status."""
     return {"status": "ok"}
 
 
 @app.post("/notify")
-async def notify(request: Request):
+async def notify(request: Request) -> JSONResponse:
+    """Handle MinIO webhook notifications and enqueue MCAP files for analysis."""
     _check_auth(request)
     try:
         body = await request.json()
-    except Exception:
+    except json.JSONDecodeError:
         return JSONResponse({"status": "ignored", "reason": "invalid json"})
 
     records = body.get("Records", [])
@@ -115,7 +119,7 @@ async def notify(request: Request):
 
 # ── Processing ─────────────────────────────────────────────────────────────
 
-def _process_and_log(s3_client, bucket: str, key: str) -> None:
+def _process_and_log(s3_client: Any, bucket: str, key: str) -> None:
     """Download, extract, analyze, and log report. Runs in a thread via asyncio.to_thread."""
     source_file = f"{bucket}/{key}"
 

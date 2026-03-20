@@ -21,7 +21,7 @@ def chunk_pcm(raw: bytes) -> list[bytes]:
     return [raw[i:i + _PCM_FRAME_BYTES] for i in range(0, len(raw) - _PCM_FRAME_BYTES + 1, _PCM_FRAME_BYTES)]
 
 
-def _safe_iter(reader: Any, topics: list[str]) -> Iterator[tuple]:
+def _safe_iter(reader: Any, topics: list[str]) -> Iterator[tuple[Any, Any, Any, Any]]:
     """Wrap iter_decoded_messages to skip messages that raise DecoderNotFoundError."""
     it = reader.iter_decoded_messages(topics=topics)
     while True:
@@ -34,6 +34,12 @@ def _safe_iter(reader: Any, topics: list[str]) -> Iterator[tuple]:
 
 
 class McapExtractor:
+    """Parses MCAP files and extracts frames, audio, and IMU data.
+
+    Supports ROS1 and ROS2 encodings. Auto-detects the camera topic if the
+    configured topic is absent in the file.
+    """
+
     def __init__(
         self,
         camera_topic: str = "/camera/image_raw",
