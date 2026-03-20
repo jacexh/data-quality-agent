@@ -4,6 +4,7 @@ from typing import Any, Callable
 import cv2
 import numpy as np
 from loguru import logger
+from mcap.reader import make_reader
 
 ImageDecodeFn = Callable[[Any], "np.ndarray | None"]
 AudioDecodeFn = Callable[[Any], bytes]
@@ -101,3 +102,74 @@ def build_default_registry() -> SchemaDecoderRegistry:
     reg.register_audio("audio_common_msgs/AudioData",  _decode_audio)
     reg.register_imu("sensor_msgs/Imu",                _decode_imu)
     return reg
+
+
+# ── ProtocolReaderFactory ────────────────────────────────────────────────────
+
+# Encoding strings found in MCAP channel metadata → logical protocol name
+_ENCODING_MAP: dict[str, str] = {
+    "ros1msg": "ros1",
+    "cdr":     "ros2",
+}
+
+_SUPPORTED: set[str] = {"ros1", "ros2"}
+
+
+class ProtocolReaderFactory:
+    """Detect MCAP file encoding and build matching mcap DecoderFactory instances."""
+
+    @classmethod
+    def build_decoder_factories(cls, path: str) -> list:
+        """Read file metadata, return a list of DecoderFactory instances.
+
+        Opens and closes a file handle internally — does not retain one.
+        Returns [] if no supported encodings are found.
+        """
+        encodings = cls._detect_encodings(path)
+        return cls._build_factories_for(encodings)
+
+    @classmethod
+    def _detect_encodings(cls, path: str) -> set[str]:
+        """Return the set of logical protocol names present in the file.
+
+        Reads summary index only (O(1)). Falls back to iter_messages() for
+        unindexed files where get_summary() returns None.
+        """
+        with open(path, "rb") as f:
+            reader = make_reader(f)
+            summary = reader.get_summary()
+
+            if summary is not None:
+                raw_encodings = {
+                    ch.metadata.get("encoding", "")
+                    for ch in summary.channels.values()
+                }
+            else:
+                # Unindexed / streaming-written file — scan Channel records
+                raw_encodings = set()
+                for item in reader.iter_messages():
+                    enc = item.channel.metadata.get("encoding", "")
+                    if enc:
+                        raw_encodings.add(enc)
+
+        protocols: set[str] = set()
+        for enc in raw_encodings:
+            protocol = _ENCODING_MAP.get(enc)
+            if protocol in _SUPPORTED:
+                protocols.add(protocol)
+            elif enc:
+                logger.warning("Unsupported MCAP encoding {:!r}, skipping", enc)
+
+        return protocols
+
+    @classmethod
+    def _build_factories_for(cls, encodings: set[str]) -> list:
+        """Lazily import and instantiate DecoderFactory for each known protocol."""
+        factories = []
+        if "ros1" in encodings:
+            from mcap_ros1.decoder import DecoderFactory as Ros1Factory  # type: ignore[import]
+            factories.append(Ros1Factory())
+        if "ros2" in encodings:
+            from mcap_ros2.decoder import DecoderFactory as Ros2Factory
+            factories.append(Ros2Factory())
+        return factories

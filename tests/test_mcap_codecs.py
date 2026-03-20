@@ -166,3 +166,101 @@ def test_build_default_registry_handles_audio():
     reg = build_default_registry()
     msg = SimpleNamespace(data=b"\x00\x01")
     assert reg.decode_audio("audio_common_msgs/AudioData", msg) == b"\x00\x01"
+
+
+# ── ProtocolReaderFactory ─────────────────────────────────────────────────────
+
+from unittest.mock import patch, MagicMock
+
+
+def _make_summary(encodings: list[str]):
+    """Build a minimal mcap Summary mock with one channel per encoding."""
+    channels = {}
+    for i, enc in enumerate(encodings):
+        ch = MagicMock()
+        ch.metadata = {"encoding": enc}
+        channels[i] = ch
+    summary = MagicMock()
+    summary.channels = channels
+    return summary
+
+
+def _patch_open_and_reader(mock_reader):
+    """Return a context manager stack that patches both open() and make_reader."""
+    from unittest.mock import patch, MagicMock
+    mock_file = MagicMock()
+    mock_file.__enter__ = lambda s: s
+    mock_file.__exit__ = MagicMock(return_value=False)
+    open_patch = patch("builtins.open", return_value=mock_file)
+    reader_patch = patch("agent.mcap_codecs.make_reader", return_value=mock_reader)
+    return open_patch, reader_patch
+
+
+def test_detect_encodings_ros1():
+    from agent.mcap_codecs import ProtocolReaderFactory
+    summary = _make_summary(["ros1msg"])
+    mock_reader = MagicMock()
+    mock_reader.get_summary.return_value = summary
+    open_patch, reader_patch = _patch_open_and_reader(mock_reader)
+    with open_patch, reader_patch:
+        encodings = ProtocolReaderFactory._detect_encodings("fake.mcap")
+    assert "ros1" in encodings
+
+
+def test_detect_encodings_ros2():
+    from agent.mcap_codecs import ProtocolReaderFactory
+    summary = _make_summary(["cdr"])
+    mock_reader = MagicMock()
+    mock_reader.get_summary.return_value = summary
+    open_patch, reader_patch = _patch_open_and_reader(mock_reader)
+    with open_patch, reader_patch:
+        encodings = ProtocolReaderFactory._detect_encodings("fake.mcap")
+    assert "ros2" in encodings
+
+
+def test_detect_encodings_unknown_emits_warning(caplog):
+    import logging
+    from agent.mcap_codecs import ProtocolReaderFactory
+    summary = _make_summary(["exotic_proto"])
+    mock_reader = MagicMock()
+    mock_reader.get_summary.return_value = summary
+    open_patch, reader_patch = _patch_open_and_reader(mock_reader)
+    with open_patch, reader_patch:
+        with patch("agent.mcap_codecs.logger") as mock_logger:
+            ProtocolReaderFactory._detect_encodings("fake.mcap")
+            mock_logger.warning.assert_called_once()
+
+
+def test_detect_encodings_none_summary_fallback():
+    """When get_summary() returns None, fall back to iter_messages() for Channel records."""
+    from agent.mcap_codecs import ProtocolReaderFactory
+    from mcap.records import Channel
+
+    channel = MagicMock(spec=Channel)
+    channel.metadata = {"encoding": "ros1msg"}
+
+    mock_reader = MagicMock()
+    mock_reader.get_summary.return_value = None
+    mock_reader.iter_messages.return_value = iter([MagicMock(channel=channel)])
+
+    open_patch, reader_patch = _patch_open_and_reader(mock_reader)
+    with open_patch, reader_patch:
+        encodings = ProtocolReaderFactory._detect_encodings("fake.mcap")
+
+    assert "ros1" in encodings
+
+
+def test_build_decoder_factories_returns_list():
+    """build_decoder_factories returns a non-empty list for known encodings."""
+    from agent.mcap_codecs import ProtocolReaderFactory
+    with patch.object(ProtocolReaderFactory, "_detect_encodings", return_value={"ros2"}):
+        factories = ProtocolReaderFactory.build_decoder_factories("fake.mcap")
+    assert isinstance(factories, list)
+    assert len(factories) >= 1
+
+
+def test_build_decoder_factories_empty_for_no_known_encodings():
+    from agent.mcap_codecs import ProtocolReaderFactory
+    with patch.object(ProtocolReaderFactory, "_detect_encodings", return_value=set()):
+        factories = ProtocolReaderFactory.build_decoder_factories("fake.mcap")
+    assert factories == []
