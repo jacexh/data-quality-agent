@@ -126,6 +126,14 @@ def test_registry_custom_audio_decoder_called():
     assert reg.decode_audio("my_msgs/Audio", object()) == b"\xff"
 
 
+def test_registry_custom_imu_decoder_called():
+    reg = SchemaDecoderRegistry()
+    sentinel = np.array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    reg.register_imu("my_msgs/MyImu", lambda msg: sentinel)
+    result = reg.decode_imu("my_msgs/MyImu", object())
+    np.testing.assert_array_equal(result, sentinel)
+
+
 # ── build_default_registry ───────────────────────────────────────────────────
 
 def test_build_default_registry_handles_sensor_msgs_image():

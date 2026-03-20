@@ -1,6 +1,7 @@
 # agent/mcap_codecs.py
 from __future__ import annotations
 from typing import Any, Callable
+import cv2
 import numpy as np
 from loguru import logger
 
@@ -20,7 +21,6 @@ def _decode_raw_image(msg: Any) -> np.ndarray | None:
         channels = 3 if "rgb" in encoding or "bgr" in encoding else 1
         arr = np.frombuffer(data, dtype=np.uint8).reshape(h, w, channels)
         if "rgb" in encoding:
-            import cv2
             arr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
         return arr
     except (AttributeError, ValueError) as e:
@@ -31,7 +31,6 @@ def _decode_raw_image(msg: Any) -> np.ndarray | None:
 def _decode_compressed_image(msg: Any) -> np.ndarray | None:
     """Decode sensor_msgs/CompressedImage (JPEG/PNG) → BGR ndarray. Returns None on failure."""
     try:
-        import cv2
         buf = np.frombuffer(bytes(msg.data), dtype=np.uint8)
         arr = cv2.imdecode(buf, cv2.IMREAD_COLOR)
         if arr is None:
