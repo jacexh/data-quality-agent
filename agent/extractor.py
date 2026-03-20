@@ -1,19 +1,54 @@
+# agent/extractor.py
 from __future__ import annotations
 import numpy as np
+from loguru import logger
+from mcap.reader import make_reader as _mcap_make_reader
+from mcap.exceptions import DecoderNotFoundError
 from agent.analyzers.base import ExtractedData
+from agent.mcap_codecs import (
+    ProtocolReaderFactory,
+    SchemaDecoderRegistry,
+    build_default_registry,
+)
 
 
 _PCM_FRAME_BYTES = 960  # 30ms × 16000Hz × 2 bytes (int16) = 960
-
-try:
-    from mcap_ros2.reader import read_ros2_messages
-except ImportError:
-    read_ros2_messages = None  # type: ignore[assignment]
 
 
 def chunk_pcm(raw: bytes) -> list[bytes]:
     """Split raw PCM bytes into 30ms frames (960 bytes each). Drops remainder."""
     return [raw[i:i + _PCM_FRAME_BYTES] for i in range(0, len(raw) - _PCM_FRAME_BYTES + 1, _PCM_FRAME_BYTES)]
+
+
+def make_reader(path: str, decoder_factories: list | None = None):
+    """Open an MCAP file by path and return an mcap Reader.
+
+    This thin wrapper keeps ``open()`` internal so tests can patch
+    ``agent.extractor.make_reader`` without needing to also patch
+    ``builtins.open``.  The caller is responsible for ensuring the returned
+    reader (and thus the underlying file) is fully consumed before the reader
+    goes out of scope; the mcap library buffers reads so the file handle is
+    only needed during iteration.
+
+    Note: the file is intentionally left open for the lifetime of the reader
+    because mcap reads lazily.  CPython's reference-counting GC will close it
+    when the reader is collected; in the rare case of a non-CPython runtime an
+    explicit ``del reader`` will release it promptly.
+    """
+    f = open(path, "rb")  # noqa: WPS515
+    return _mcap_make_reader(f, decoder_factories=decoder_factories or [])
+
+
+def _safe_iter(reader, topics: list[str]):
+    """Wrap iter_decoded_messages to skip messages that raise DecoderNotFoundError."""
+    it = reader.iter_decoded_messages(topics=topics)
+    while True:
+        try:
+            yield next(it)
+        except DecoderNotFoundError as e:
+            logger.warning("No decoder for message encoding, skipping: {}", e)
+        except StopIteration:
+            return
 
 
 class McapExtractor:
@@ -23,55 +58,50 @@ class McapExtractor:
         audio_topic: str = "/audio/data",
         imu_topic: str = "/imu/data",
         frame_sample_rate: int = 1,
+        registry: SchemaDecoderRegistry | None = None,
     ) -> None:
         self._camera_topic = camera_topic
         self._audio_topic = audio_topic
         self._imu_topic = imu_topic
         self._frame_sample_rate = max(1, frame_sample_rate)
+        self._registry = registry if registry is not None else build_default_registry()
 
     def extract(self, mcap_path: str) -> ExtractedData:
         """Parse an MCAP file and return ExtractedData.
 
-        Frames are decoded from sensor_msgs/Image messages.
-        Audio is decoded from audio_common_msgs/AudioData messages and chunked to 30ms PCM frames.
-        IMU is accumulated from sensor_msgs/Imu messages.
+        Auto-detects ROS1/ROS2 encoding. Handles both sensor_msgs/Image and
+        sensor_msgs/CompressedImage. Audio and IMU extraction unchanged.
         """
         raw_frames: list[np.ndarray] = []
         _audio_buf = bytearray()
         imu_rows: list[np.ndarray] = []
         timestamps: list[float] = []
 
-        if read_ros2_messages is None:
-            raise RuntimeError("mcap-ros2-support not installed")
+        topics = [self._camera_topic, self._audio_topic, self._imu_topic]
+        decoder_factories = ProtocolReaderFactory.build_decoder_factories(mcap_path)
+        reader = make_reader(mcap_path, decoder_factories=decoder_factories)
 
-        try:
-            for msg in read_ros2_messages(mcap_path, topics=[
-                self._camera_topic, self._audio_topic, self._imu_topic
-            ]):
-                t = msg.log_time / 1e9  # nanoseconds → seconds
-                timestamps.append(t)
-                topic = msg.channel.topic
+        for schema, channel, message, decoded_message in _safe_iter(reader, topics):
+            t = message.log_time / 1e9
+            timestamps.append(t)
+            topic = channel.topic
 
-                if topic == self._camera_topic:
-                    frame = self._decode_image(msg.ros_msg)
-                    if frame is not None:
-                        raw_frames.append(frame)
+            if topic == self._camera_topic:
+                frame = self._registry.decode_image(schema.name, decoded_message)
+                if frame is not None:
+                    raw_frames.append(frame)
 
-                elif topic == self._audio_topic:
-                    chunk = self._decode_audio(msg.ros_msg)
-                    if chunk:
-                        _audio_buf.extend(chunk)
+            elif topic == self._audio_topic:
+                chunk = self._registry.decode_audio(schema.name, decoded_message)
+                if chunk:
+                    _audio_buf.extend(chunk)
 
-                elif topic == self._imu_topic:
-                    row = self._decode_imu(msg.ros_msg)
-                    if row is not None:
-                        imu_rows.append(row)
-        except Exception:
-            # Gracefully handle empty or malformed MCAP files
-            pass
+            elif topic == self._imu_topic:
+                row = self._registry.decode_imu(schema.name, decoded_message)
+                if row is not None:
+                    imu_rows.append(row)
 
-        # Apply frame sampling: take every Nth frame, always keep at least 1 if any exist
-        frames: list[np.ndarray]
+        # Apply frame sampling: keep every Nth frame, always keep at least 1 if any exist
         if raw_frames:
             frames = raw_frames[::self._frame_sample_rate]
             if not frames:
@@ -92,31 +122,3 @@ class McapExtractor:
             sensor_series=sensor_series,
             duration_seconds=duration,
         )
-
-    def _decode_image(self, msg) -> np.ndarray | None:
-        try:
-            h, w = msg.height, msg.width
-            data = bytes(msg.data)
-            encoding = getattr(msg, "encoding", "bgr8")
-            channels = 3 if "rgb" in encoding or "bgr" in encoding else 1
-            arr = np.frombuffer(data, dtype=np.uint8).reshape(h, w, channels)
-            if "rgb" in encoding:
-                import cv2
-                arr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
-            return arr
-        except Exception:
-            return None
-
-    def _decode_audio(self, msg) -> bytes:
-        try:
-            return bytes(msg.data)
-        except Exception:
-            return b""
-
-    def _decode_imu(self, msg) -> np.ndarray | None:
-        try:
-            a = msg.linear_acceleration
-            g = msg.angular_velocity
-            return np.array([a.x, a.y, a.z, g.x, g.y, g.z], dtype=np.float64)
-        except Exception:
-            return None
