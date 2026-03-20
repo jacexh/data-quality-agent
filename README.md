@@ -6,6 +6,8 @@
 
 MinIO 存储桶上传触发 webhook → 有界队列 + 多 worker 并发下载 → 帧采样提取 → 并发算法检测 → LLM 裁决（按需）→ JSON 质量报告。
 
+支持两种运行模式：**Server 模式**（FastAPI + MinIO webhook）和 **CLI 模式**（本地文件直接分析）。
+
 ## 功能概览
 
 - **图像清晰度检测**：Laplacian + Tenengrad 方差，量化视频帧的焦距质量
@@ -20,6 +22,8 @@ MinIO 存储桶上传触发 webhook → 有界队列 + 多 worker 并发下载 �
 ```
 agent/
 ├── main.py          # FastAPI：POST /notify（webhook）, GET /health
+├── cli.py           # CLI 入口：agent-cli analyze <file.mcap>
+├── runner.py        # 共享分析逻辑：analyze_local_file()，Server 和 CLI 共用
 ├── config.py        # Pydantic Settings，从 .env 读取
 ├── extractor.py     # McapExtractor：.mcap → ExtractedData（帧/音频/传感器）
 ├── pipeline.py      # AnalysisPipeline：ThreadPoolExecutor 并发运行 5 个检测器
@@ -57,7 +61,25 @@ MinIO S3 事件
 - [uv](https://github.com/astral-sh/uv) 包管理器
 - Docker & Docker Compose（完整栈运行）
 
-### 本地开发
+### CLI 模式（本地文件分析）
+
+无需启动服务，直接分析本地 `.mcap` 文件：
+
+```bash
+# 安装依赖
+uv pip install -e ".[dev]"
+
+# 配置环境变量（ANTHROPIC_API_KEY 可选，缺失时跳过 LLM 裁决）
+cp .env.example .env
+
+# 分析本地文件，JSON 报告输出到 stdout
+agent-cli analyze /path/to/recording.mcap
+
+# 退出码：0 = 质量合格，1 = 不合格或分析错误，2 = 参数错误
+echo "Exit: $?"
+```
+
+### Server 模式（本地开发）
 
 ```bash
 # 安装依赖
