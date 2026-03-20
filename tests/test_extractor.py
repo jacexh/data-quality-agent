@@ -67,7 +67,7 @@ def test_frame_sample_rate_reduces_frame_count(tmp_path):
     assert len(data["frames"]) == 5  # 25 // 5 = 5
 
 
-def test_frame_sample_rate_1_returns_all_frames(tmp_path):
+def test_frame_sample_rate_1_returns_all_frames():
     """sample_rate=1 (default) returns all frames unchanged."""
     from unittest.mock import patch, MagicMock
 

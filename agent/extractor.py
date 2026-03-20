@@ -71,6 +71,7 @@ class McapExtractor:
             pass
 
         # Apply frame sampling: take every Nth frame, always keep at least 1 if any exist
+        frames: list[np.ndarray]
         if raw_frames:
             frames = raw_frames[::self._frame_sample_rate]
             if not frames:
