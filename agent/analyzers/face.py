@@ -9,17 +9,22 @@ class FaceDetector:
     def __init__(self, model_path: str = "models/yunet.onnx", conf_threshold: float = 0.6) -> None:
         self._model_path = model_path
         self._conf_threshold = conf_threshold
-        self._detector = None  # lazy init — avoid loading on import
+        # Cache by (width, height) to avoid reloading the ONNX model every frame.
+        # Each FaceDetector instance is called from a single thread (ThreadPoolExecutor
+        # dispatches one analyzer per worker), so this dict is not shared across threads.
+        self._detector_cache: dict[tuple[int, int], cv2.FaceDetectorYN] = {}
 
     def _get_detector(self, width: int, height: int) -> cv2.FaceDetectorYN:
-        detector = cv2.FaceDetectorYN.create(
-            self._model_path,
-            "",
-            (width, height),
-            score_threshold=self._conf_threshold,
-            nms_threshold=0.3,
-        )
-        return detector
+        key = (width, height)
+        if key not in self._detector_cache:
+            self._detector_cache[key] = cv2.FaceDetectorYN.create(
+                self._model_path,
+                "",
+                (width, height),
+                score_threshold=self._conf_threshold,
+                nms_threshold=0.3,
+            )
+        return self._detector_cache[key]
 
     def name(self) -> str:
         return "face"

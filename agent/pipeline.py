@@ -1,6 +1,7 @@
 from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
+from loguru import logger
 from agent.analyzers.base import Analyzer, ExtractedData
 
 
@@ -27,7 +28,8 @@ class AnalysisPipeline:
                 name = analyzer.name()
                 try:
                     results[name] = future.result()
-                except Exception:
+                except Exception as exc:
+                    logger.error("Analyzer {!r} failed: {}", name, exc, exc_info=True)
                     results[name] = None
                     errors.append(name)
 

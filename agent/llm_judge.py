@@ -156,6 +156,7 @@ class LLMJudge:
                 system=_SYSTEM_PROMPT,
                 tools=tools,
                 messages=messages,
+                timeout=60.0,
             )
 
             if response.stop_reason != "tool_use":
@@ -163,7 +164,11 @@ class LLMJudge:
                 text = next(
                     (b.text for b in response.content if hasattr(b, "text")), "{}"
                 )
-                return json.loads(text)
+                try:
+                    return json.loads(text)
+                except json.JSONDecodeError as exc:
+                    logger.error("LLM returned invalid JSON: {}…", text[:200])
+                    raise RuntimeError("LLM response was not valid JSON") from exc
 
             # Process tool calls and append results
             tool_results: list[dict[str, Any]] = []
@@ -192,6 +197,7 @@ class LLMJudge:
         if name == "get_key_frames":
             indices = inputs.get("frame_indices", [])
             result = []
+            out_of_bounds = []
             for idx in indices:
                 if 0 <= idx < len(frames):
                     _, buf = cv2.imencode(".jpg", frames[idx], [cv2.IMWRITE_JPEG_QUALITY, 70])
@@ -199,18 +205,36 @@ class LLMJudge:
                         "frame_index": idx,
                         "image_b64": base64.b64encode(buf.tobytes()).decode(),
                     })
+                else:
+                    out_of_bounds.append(idx)
+            if out_of_bounds:
+                result.append({
+                    "warning": f"indices {out_of_bounds} out of range (total frames: {len(frames)})"
+                })
             return json.dumps(result)
 
         elif name == "get_imu_summary":
-            # Simplified: return overall stats regardless of window
-            for key, arr in imu.items():
+            # IMU rows contain sensor values only; per-row timestamps are not stored,
+            # so window_start/window_end cannot be used for precise filtering.
+            # Returns overall stats across all available IMU data.
+            window_start = inputs.get("window_start")
+            window_end = inputs.get("window_end")
+            for _imu_key, arr in imu.items():
                 if arr.shape[1] >= 3:
                     acc = arr[:, :3]
-                    return json.dumps({
+                    summary: dict[str, Any] = {
                         "mean_acceleration": float(np.linalg.norm(acc, axis=1).mean()),
                         "max_angular_velocity": float(np.abs(arr[:, 3:6]).max()) if arr.shape[1] >= 6 else 0.0,
                         "mean_angular_velocity": float(np.abs(arr[:, 3:6]).mean()) if arr.shape[1] >= 6 else 0.0,
-                    })
-            return json.dumps({"mean_acceleration": 0.0, "max_angular_velocity": 0.0, "mean_angular_velocity": 0.0})
+                    }
+                    if window_start is not None or window_end is not None:
+                        summary["note"] = "per-row timestamps unavailable; stats cover full recording"
+                    return json.dumps(summary)
+            return json.dumps({
+                "mean_acceleration": 0.0,
+                "max_angular_velocity": 0.0,
+                "mean_angular_velocity": 0.0,
+                "note": "no_imu_data",
+            })
 
         return json.dumps({"error": f"unknown tool: {name}"})

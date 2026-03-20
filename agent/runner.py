@@ -19,7 +19,9 @@ _extractor = McapExtractor(frame_sample_rate=settings.frame_sample_rate)
 
 _model_path = os.path.join(settings.model_dir, "yunet.onnx")
 if not os.path.exists(_model_path):
-    _model_path = os.path.join(os.getcwd(), "models", "yunet.onnx")
+    _fallback = os.path.join(os.getcwd(), "models", "yunet.onnx")
+    logger.info("Model not found at {!r}, trying fallback {!r}", _model_path, _fallback)
+    _model_path = _fallback
 
 _pipeline = AnalysisPipeline(analyzers=[
     ClarityAnalyzer(),
@@ -47,7 +49,7 @@ def analyze_local_file(local_path: str, source_file: str = "", bucket: str = "")
     try:
         data = _extractor.extract(local_path)
     except Exception as exc:
-        logger.error("MCAP extraction failed for {!r}: {}", local_path, exc)
+        logger.error("MCAP extraction failed for {!r}: {}", local_path, exc, exc_info=True)
         return _builder.build(
             source_file=src, bucket=bucket,
             detector_results={}, detector_errors=["mcap_extraction"],

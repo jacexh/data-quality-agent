@@ -31,7 +31,7 @@ def _decode_raw_image(msg: Any) -> np.ndarray | None:
         if "rgb" in encoding:
             arr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
         return arr
-    except (AttributeError, ValueError) as e:
+    except (AttributeError, ValueError, IndexError, TypeError) as e:
         logger.debug("_decode_raw_image failed: {}", e)
         return None
 
@@ -44,7 +44,7 @@ def _decode_compressed_image(msg: Any) -> np.ndarray | None:
         if arr is None:
             logger.debug("_decode_compressed_image: cv2.imdecode returned None")
         return arr
-    except (AttributeError, ValueError) as e:
+    except (AttributeError, ValueError, IndexError, TypeError) as e:
         logger.debug("_decode_compressed_image failed: {}", e)
         return None
 
@@ -53,7 +53,7 @@ def _decode_audio(msg: Any) -> bytes:
     """Decode audio_common_msgs/AudioData → raw bytes. Returns b'' on failure."""
     try:
         return bytes(msg.data)
-    except AttributeError as e:
+    except (AttributeError, TypeError) as e:
         logger.debug("_decode_audio failed: {}", e)
         return b""
 
@@ -64,7 +64,7 @@ def _decode_imu(msg: Any) -> np.ndarray | None:
         a = msg.linear_acceleration
         g = msg.angular_velocity
         return np.array([a.x, a.y, a.z, g.x, g.y, g.z], dtype=np.float64)
-    except AttributeError as e:
+    except (AttributeError, TypeError, ValueError) as e:
         logger.debug("_decode_imu failed: {}", e)
         return None
 

@@ -1,4 +1,5 @@
 import webrtcvad
+from loguru import logger
 from agent.analyzers.base import ExtractedData, VoiceResult
 
 _SAMPLE_RATE = 16000
@@ -24,7 +25,8 @@ class VoiceDetector:
             try:
                 if self._vad.is_speech(frame, _SAMPLE_RATE):
                     speech_count += 1
-            except Exception:
+            except Exception as exc:
+                logger.debug("VAD check failed on frame ({}B): {}", len(frame), exc)
                 continue
 
         speech_frame_ratio = speech_count / len(audio_frames)

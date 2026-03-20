@@ -2,6 +2,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import tempfile
 from contextlib import asynccontextmanager
 from typing import Any
@@ -28,7 +29,13 @@ def _make_s3_client() -> Any:
         endpoint_url=f"http{'s' if settings.minio_use_ssl else ''}://{settings.minio_endpoint}",
         aws_access_key_id=settings.minio_access_key,
         aws_secret_access_key=settings.minio_secret_key,
-        config=Config(signature_version="s3v4", max_pool_connections=4),
+        config=Config(
+            signature_version="s3v4",
+            max_pool_connections=4,
+            connect_timeout=10,
+            read_timeout=300,
+            retries={"max_attempts": 3, "mode": "adaptive"},
+        ),
     )
 
 
@@ -81,13 +88,17 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+_BUCKET_RE = re.compile(r"^[a-zA-Z0-9.\-]{1,63}$")
+_KEY_RE = re.compile(r"^[^\x00]{1,1024}$")  # no null bytes, reasonable length
+
+
 @app.post("/notify")
 async def notify(request: Request) -> JSONResponse:
     """Handle MinIO webhook notifications and enqueue MCAP files for analysis."""
     _check_auth(request)
     try:
         body = await request.json()
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, UnicodeDecodeError):
         return JSONResponse({"status": "ignored", "reason": "invalid json"})
 
     records = body.get("Records", [])
@@ -96,6 +107,14 @@ async def notify(request: Request) -> JSONResponse:
 
     key = records[0].get("s3", {}).get("object", {}).get("key", "")
     bucket = records[0].get("s3", {}).get("bucket", {}).get("name", settings.minio_bucket)
+
+    if not isinstance(key, str) or not _KEY_RE.match(key):
+        logger.warning(f"Rejecting webhook with invalid key: {key!r}")
+        return JSONResponse({"status": "ignored", "reason": "invalid_key"})
+
+    if not isinstance(bucket, str) or not _BUCKET_RE.match(bucket):
+        logger.warning(f"Rejecting webhook with invalid bucket: {bucket!r}")
+        return JSONResponse({"status": "ignored", "reason": "invalid_bucket"})
 
     if not key.endswith(".mcap"):
         logger.info(f"Skipping non-mcap file: {key}")
@@ -127,6 +146,8 @@ def _process_and_log(s3_client: Any, bucket: str, key: str) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             local_path = os.path.join(tmpdir, os.path.basename(key))
             s3_client.download_file(bucket, key, local_path)
+            if not os.path.exists(local_path) or os.path.getsize(local_path) == 0:
+                raise OSError(f"S3 download produced empty or missing file: {local_path}")
             _analyze_and_log(source_file, bucket, local_path)
     except Exception as exc:
         report = _builder.build(

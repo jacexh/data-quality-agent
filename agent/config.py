@@ -1,4 +1,5 @@
-from pydantic import Field
+import warnings
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -27,6 +28,16 @@ class Settings(BaseSettings):
     max_queue_size: int = Field(default=100, gt=0)
     worker_count: int = Field(default=4, gt=0)
     frame_sample_rate: int = Field(default=30, gt=0)
+
+    @model_validator(mode="after")
+    def warn_if_no_api_key(self) -> "Settings":
+        if not self.anthropic_api_key:
+            warnings.warn(
+                "ANTHROPIC_API_KEY is not set — LLM judgment will be skipped and "
+                "fall back to detector results.",
+                stacklevel=2,
+            )
+        return self
 
 
 settings = Settings()
