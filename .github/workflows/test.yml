@@ -40,6 +40,8 @@ jobs:
 
       - name: Publish test results
         if: always()
-        uses: EnricoMi/publish-test-results-action@v2
+        uses: dorny/test-reporter@v1
         with:
-          files: reports/junit.xml
+          name: pytest
+          path: reports/junit.xml
+          reporter: java-junit
