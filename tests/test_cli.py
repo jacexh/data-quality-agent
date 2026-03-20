@@ -1,6 +1,5 @@
 # tests/test_cli.py
 import json
-import pytest
 from unittest.mock import patch
 
 
@@ -23,7 +22,7 @@ FAILING_REPORT = {**PASSING_REPORT, "passed": False, "failure_reasons": ["clarit
 
 
 def _run_cli(argv, mock_report=None):
-    """Run cli.main() with given argv, return (stdout_lines, exit_code)."""
+    """Run cli.main() with given argv, return (stdout_string, exit_code)."""
     import sys
     from io import StringIO
 
@@ -38,8 +37,6 @@ def _run_cli(argv, mock_report=None):
          patch("agent.runner.analyze_local_file", return_value=mock_report):
         try:
             from agent import cli
-            import importlib
-            importlib.reload(cli)  # ensure fresh import each time
             cli.main()
         except SystemExit as e:
             exit_code = e.code
