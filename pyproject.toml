@@ -26,6 +26,9 @@ dev = [
     "pytest-mock>=3.14",
 ]
 
+[project.scripts]
+agent-cli = "agent.cli:main"
+
 [tool.setuptools.packages.find]
 include = ["agent*"]
 
