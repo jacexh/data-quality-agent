@@ -113,3 +113,44 @@ def test_frame_sample_rate_larger_than_frame_count_returns_one_frame():
         data = extractor.extract("fake.mcap")
 
     assert len(data["frames"]) >= 1
+
+
+def test_audio_bytearray_output_identical_to_concat():
+    """bytearray accumulation must produce byte-identical output to += concatenation."""
+    # Simulate what the old code did
+    chunks = [b"\x01\x02" * 100, b"\x03\x04" * 100, b"\x05\x06" * 100]
+    old_result = b""
+    for chunk in chunks:
+        old_result += chunk
+
+    # What the new code must produce
+    _buf = bytearray()
+    for chunk in chunks:
+        _buf.extend(chunk)
+    new_result = bytes(_buf)
+
+    assert new_result == old_result
+
+
+def test_audio_not_sampled_by_frame_sample_rate():
+    """Audio frames are never reduced by frame_sample_rate."""
+    from unittest.mock import patch, MagicMock
+
+    extractor = McapExtractor(frame_sample_rate=100)  # extreme sampling
+
+    def make_audio_msg(i):
+        m = MagicMock()
+        m.log_time = i * 1_000_000_000
+        m.channel.topic = "/audio/data"
+        # 960 bytes = one full PCM frame
+        m.ros_msg.data = bytes([0] * 960)
+        return m
+
+    msgs = [make_audio_msg(i) for i in range(10)]  # 10 audio messages = 10 PCM frames
+
+    with patch("agent.extractor.read_ros2_messages", return_value=iter(msgs)):
+        data = extractor.extract("fake.mcap")
+
+    # All 10 PCM frames must be present regardless of frame_sample_rate
+    assert data["audio_frames"] is not None
+    assert len(data["audio_frames"]) == 10

@@ -37,7 +37,7 @@ class McapExtractor:
         IMU is accumulated from sensor_msgs/Imu messages.
         """
         raw_frames: list[np.ndarray] = []
-        raw_audio = b""
+        _audio_buf = bytearray()
         imu_rows: list[np.ndarray] = []
         timestamps: list[float] = []
 
@@ -60,7 +60,7 @@ class McapExtractor:
                 elif topic == self._audio_topic:
                     chunk = self._decode_audio(msg.ros_msg)
                     if chunk:
-                        raw_audio += chunk
+                        _audio_buf.extend(chunk)
 
                 elif topic == self._imu_topic:
                     row = self._decode_imu(msg.ros_msg)
@@ -80,6 +80,7 @@ class McapExtractor:
             frames = []
 
         duration = (max(timestamps) - min(timestamps)) if len(timestamps) >= 2 else 0.0
+        raw_audio = bytes(_audio_buf)
         audio_frames = chunk_pcm(raw_audio) if raw_audio else None
         sensor_series = {}
         if imu_rows:
