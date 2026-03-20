@@ -1,5 +1,7 @@
 # Data Quality Agent
 
+[![Tests](https://github.com/jacexh/data-quality-agent/actions/workflows/test.yml/badge.svg)](https://github.com/jacexh/data-quality-agent/actions/workflows/test.yml)
+
 机器人传感器数据（MCAP 文件）自动质量评估系统。
 
 MinIO 存储桶上传触发 webhook → 有界队列 + 多 worker 并发下载 → 帧采样提取 → 并发算法检测 → LLM 裁决（按需）→ JSON 质量报告。
@@ -209,6 +211,12 @@ uv run pytest tests/analyzers/
 # 详细输出
 uv run pytest -xvs tests/test_main.py
 ```
+
+每次代码提交时，GitHub Actions 自动执行完整测试套件并生成报告：
+
+- **Badge 状态**：页面顶部徽章实时反映最新 CI 结果
+- **测试报告**：在 [Actions](https://github.com/jacexh/data-quality-agent/actions/workflows/test.yml) 页面 → 选择任意一次运行 → **pytest** tab 查看每个用例的通过/失败详情
+- **JUnit XML**：每次运行的 `reports/junit.xml` 作为 Artifact 可下载，供外部工具（如 SonarQube）集成
 
 ## 模型文件
 
