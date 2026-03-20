@@ -39,36 +39,46 @@ Extract the core analysis logic from `main.py` into a shared function, then have
 
 ```
 agent/
-├── main.py        # FastAPI server — extracts _analyze_local() as shared helper
-├── cli.py         # NEW: CLI entry point
+├── runner.py      # NEW: shared singletons + analyze_local_file()
+├── main.py        # FastAPI server — imports from runner.py, _analyze_and_log() becomes thin wrapper
+├── cli.py         # NEW: CLI entry point — imports from runner.py
 └── ...
 
 pyproject.toml     # Adds [project.scripts] entry
 ```
 
-### Shared Function Extraction
+### Shared Module: `agent/runner.py`
 
-`main.py` currently contains `_analyze_and_log(source_file, bucket, local_path)` which is tightly coupled to the server context (logs via loguru, uses module-level singletons). We extract the pure analysis logic into a standalone function:
+Importing `agent/main.py` triggers FastAPI app construction, asyncio Queue creation, and boto3 client setup at module scope — none of which the CLI needs. To avoid these import-time side effects, the shared analysis logic lives in a new `agent/runner.py` module. Both `main.py` and `cli.py` import from it.
+
+`agent/runner.py` contains:
+- Singleton initialization (extractor, pipeline, judge, builder) shared between server and CLI
+- `analyze_local_file()`: the pure analysis function that returns a report dict
 
 ```python
-# agent/main.py (or a shared module)
+# agent/runner.py
 def analyze_local_file(local_path: str, source_file: str = "", bucket: str = "") -> dict:
-    """Run the full pipeline on a local MCAP file. Returns the report dict."""
-    data = _extractor.extract(local_path)
+    """Run the full pipeline on a local MCAP file. Returns a report dict (never raises)."""
+    src = source_file or local_path
+    try:
+        data = _extractor.extract(local_path)
+    except Exception:
+        return _builder.build(
+            source_file=src, bucket=bucket,
+            detector_results={}, detector_errors=["mcap_extraction"],
+            llm_assessment=None, llm_error=None, duration_seconds=None,
+        )
     detector_results, detector_errors = _pipeline.run(data)
     llm_assessment, llm_error = _judge.judge(detector_results, data)
     return _builder.build(
-        source_file=source_file or local_path,
-        bucket=bucket,
-        detector_results=detector_results,
-        detector_errors=detector_errors,
-        llm_assessment=llm_assessment,
-        llm_error=llm_error,
+        source_file=src, bucket=bucket,
+        detector_results=detector_results, detector_errors=detector_errors,
+        llm_assessment=llm_assessment, llm_error=llm_error,
         duration_seconds=data["duration_seconds"],
     )
 ```
 
-`_analyze_and_log` becomes a thin wrapper that calls this and logs. No behavior change for the server path.
+`analyze_local_file()` never raises — extraction failures produce a structured error report (same as the server path in `_analyze_and_log`). `main.py` is updated to import singletons and `analyze_local_file` from `runner.py`; `_analyze_and_log` becomes a thin wrapper that calls it and logs.
 
 ### CLI Entry Point (`agent/cli.py`)
 
@@ -100,7 +110,7 @@ agent-cli analyze /data/file.mcap
 agent/cli.py::main()
         │  validates path
         ▼
-analyze_local_file(path)   ← shared with main.py server path
+analyze_local_file(path)   ← from agent/runner.py, shared with main.py server path
         │
         ├── McapExtractor.extract()
         ├── AnalysisPipeline.run()  (ThreadPoolExecutor, 5 analyzers)
@@ -161,11 +171,18 @@ agent-cli analyze /path/to/recording.mcap
 
 ---
 
+## Known Schema Deviations
+
+For CLI runs, `"minio_bucket"` in the JSON report will be an empty string (`""`). This is intentional — the file did not originate from MinIO. Consumers of the report should treat `minio_bucket: ""` as a signal that the file was analyzed from local disk. No change to `ReportBuilder` is required.
+
+---
+
 ## Files Changed
 
 | File | Change |
 |------|--------|
-| `agent/main.py` | Extract `analyze_local_file()` helper; `_analyze_and_log` becomes thin wrapper |
-| `agent/cli.py` | New file: CLI entry point |
+| `agent/runner.py` | **New file**: shared singletons + `analyze_local_file()` |
+| `agent/main.py` | Import singletons and `analyze_local_file` from `runner.py`; `_analyze_and_log` becomes thin wrapper |
+| `agent/cli.py` | **New file**: CLI entry point |
 | `pyproject.toml` | Add `[project.scripts]` entry |
-| `tests/test_cli.py` | New file: CLI tests |
+| `tests/test_cli.py` | **New file**: CLI tests |
