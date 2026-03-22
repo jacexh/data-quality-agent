@@ -27,7 +27,6 @@ Robot sensor data (MCAP files) commonly contains multiple image topics (e.g., fr
 
 - Cross-camera comparison or synchronization analysis.
 - Merging frames across cameras before analysis.
-- Changing the Analyzer Protocol signatures (they remain single-stream: receive `list[np.ndarray]` or `list[bytes]`, return a single result).
 
 ---
 
@@ -45,9 +44,19 @@ class ExtractedData(TypedDict):
     duration_seconds: float
 ```
 
-**All four visual analyzers** (`clarity.py`, `continuity.py`, `face.py`, `gait.py`) currently read `data["frames"]` — this key is removed. The pipeline (see Layer 3) will extract `frames: list[np.ndarray]` from the single-topic dict and pass it directly to each analyzer. Analyzer signatures do **not** change; the routing change is entirely in the pipeline/runner layer.
+**Analyzer Protocol change:** The `Analyzer` Protocol's `analyze(self, data: ExtractedData)` signature changes to accept the stream directly, eliminating the need for `ExtractedData` indirection inside analyzers:
 
-`VoiceDetector` currently reads `data["audio_frames"]` — same treatment: runner extracts `audio_frames: list[bytes]` from the single-topic dict and passes it to the analyzer directly.
+```python
+# Visual analyzers: clarity, continuity, face, gait
+def analyze(self, frames: list[np.ndarray]) -> <ResultType>:
+    ...
+
+# Audio analyzer: voice
+def analyze(self, audio_frames: list[bytes]) -> VoiceResult:
+    ...
+```
+
+All five analyzer files (`clarity.py`, `continuity.py`, `face.py`, `gait.py`, `voice.py`) must be updated: replace `data["frames"]` / `data["audio_frames"]` access with the direct parameter. This is a mechanical change — no analysis logic changes.
 
 Add result containers for per-topic report output:
 
@@ -101,7 +110,7 @@ def _resolve_topics(self) -> tuple[list[str], list[str]]:
     # Otherwise return all discovered image / audio topics, sorted by channel name
 ```
 
-Frame extraction buckets messages by topic:
+Frame extraction buckets messages by topic, then applies sampling and `min_frames` validation per topic:
 
 ```python
 videos: dict[str, list[np.ndarray]] = {t: [] for t in video_topics}
@@ -112,7 +121,16 @@ for schema, channel, message in reader.iter_messages(topics=all_topics):
         videos[channel.topic].append(decode_image(message))
     elif channel.topic in audios:
         audios[channel.topic].append(decode_audio(message))
+
+# Post-loop: apply frame_sample_rate and min_frames per topic
+for topic in list(videos):
+    videos[topic] = videos[topic][::self._frame_sample_rate]
+    if len(videos[topic]) < self._min_frames:
+        logger.warning(f"Topic {topic} has only {len(videos[topic])} frames after sampling — treated as empty")
+        videos[topic] = []  # triggers zero-frames failure path in runner
 ```
+
+Audio topics are not sub-sampled (PCM frame rate is already fixed at 30ms).
 
 **Config migration:**
 
@@ -176,17 +194,43 @@ class LLMJudge:
 
 `_run_agent` accesses frames directly from the parameter (no longer reads `data["frames"]`). `get_key_frames` tool samples from the passed `frames` list.
 
-**Concurrency:** Per-topic LLM calls are dispatched via `ThreadPoolExecutor` with a cap of `min(N_topics, settings.llm_max_concurrent_calls)` (new config field, default 4). One shared `LLMJudge` instance is reused across topics (it is stateless).
+**Concurrency:** Per-topic LLM calls are dispatched via `ThreadPoolExecutor` with a cap of `settings.llm_max_concurrent_calls` (new config field, default 4). One shared `LLMJudge` instance is reused across topics (it is stateless).
+
+The runner uses an intermediate dict during the detection phase to carry frames alongside results, then runs LLM concurrently:
 
 ```python
-# runner.py — concurrent LLM phase after detector phase
+# runner.py — detection phase builds intermediate list (not CameraResult yet)
+camera_intermediates: list[dict] = []
+for topic, frames in data["videos"].items():
+    if not frames:
+        camera_intermediates.append({"topic": topic, "frames": [], "results": {}, "errors": ["zero_frames"], "needs_llm": False})
+        continue
+    results, errors = pipeline.run_visual(frames)
+    camera_intermediates.append({
+        "topic": topic,
+        "frames": frames,
+        "results": results,
+        "errors": errors,
+        "needs_llm": should_invoke_llm(results),  # existing function from llm_judge.py
+        "llm_result": None,
+        "llm_skipped_reason": None,
+    })
+
+# runner.py — concurrent LLM phase
 with ThreadPoolExecutor(max_workers=settings.llm_max_concurrent_calls) as executor:
     futures = {
-        executor.submit(judge.judge, r["topic"], r["detector_results"], r["frames"], None): r
-        for r in camera_results if _needs_llm(r)
+        executor.submit(judge.judge, item["topic"], item["results"], item["frames"], None): item
+        for item in camera_intermediates if item["needs_llm"]
     }
-    # similarly for audio_results
+    for future, item in futures.items():
+        item["llm_result"] = future.result()
+
+# runner.py — build final CameraResult list
+camera_results = [_build_camera_result(item) for item in camera_intermediates]
+# similarly for audio_intermediates / audio_results
 ```
+
+`should_invoke_llm()` is the existing function from `llm_judge.py` — no new helper needed.
 
 ### Layer 5: Report (`report.py`)
 
@@ -295,15 +339,20 @@ overall_passed = cameras_passed and audios_passed
 
 | File | Change |
 |------|--------|
-| `agent/analyzers/base.py` | Replace `frames`/`audio_frames` with `videos`/`audios`; add `CameraResult`, `AudioResult` |
-| `agent/extractor.py` | Updated `__init__` signature; `_resolve_topics()` returns all topics; frame bucketing |
+| `agent/analyzers/base.py` | Replace `frames`/`audio_frames` with `videos`/`audios`; update `Analyzer` Protocol signatures; add `CameraResult`, `AudioResult` |
+| `agent/analyzers/clarity.py` | `analyze(self, data: ExtractedData)` → `analyze(self, frames: list[np.ndarray])` |
+| `agent/analyzers/continuity.py` | Same as clarity |
+| `agent/analyzers/face.py` | Same as clarity |
+| `agent/analyzers/gait.py` | Same as clarity |
+| `agent/analyzers/voice.py` | `analyze(self, data: ExtractedData)` → `analyze(self, audio_frames: list[bytes])` |
+| `agent/extractor.py` | Updated `__init__` signature; `_resolve_topics()` returns all topics; per-topic bucketing + sampling + min_frames |
 | `agent/config.py` | Replace single-topic fields with list fields; add strategy fields and `llm_max_concurrent_calls` |
 | `agent/pipeline.py` | Replace `run()` with `run_visual(frames)` and `run_audio(audio_frames)` |
-| `agent/runner.py` | Per-topic loop; concurrent LLM phase with bounded thread pool |
-| `agent/llm_judge.py` | New `judge()` signature taking explicit frames/audio_frames; remove `data["frames"]` access |
-| `agent/report.py` | New schema with `cameras`/`audios` arrays; strategy-based `overall_passed` |
+| `agent/runner.py` | Per-topic intermediate loop; concurrent LLM phase with bounded thread pool; final result assembly |
+| `agent/llm_judge.py` | New `judge()` signature taking explicit `frames`/`audio_frames`; remove `data["frames"]` access |
+| `agent/report.py` | New schema with `cameras`/`audios` arrays; `evaluate_strategy()`; strategy-based `overall_passed` |
 | `tests/conftest.py` | Update `ExtractedData` fixtures to use `videos`/`audios` keys |
-| `tests/` (all) | Update fixture construction, `build()` call assertions, analyzer unit tests |
+| `tests/` (all) | Update fixture construction, `build()` call assertions, per-topic result assertions |
 
 ---
 
@@ -323,4 +372,4 @@ ExtractedData(videos={"/camera/image_raw": [...]}, audios={"/audio": [...]}, ...
 
 Tests for `ReportBuilder.build()` must assert on `report["cameras"][0]["clarity"]` instead of `report["scores"]["clarity"]`.
 
-Analyzer unit tests (e.g., `test_clarity_analyzer`) remain structurally unchanged — they call `analyzer.analyze(frames)` directly with a plain list, which is unaffected by the `ExtractedData` schema change.
+Analyzer unit tests (e.g., `test_clarity_analyzer`) become **simpler** — they now call `analyzer.analyze(frames)` directly with a plain list instead of constructing an `ExtractedData` wrapper. Any existing test that built `ExtractedData(frames=...)` to pass to an analyzer must be updated to pass the list directly.
