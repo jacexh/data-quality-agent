@@ -1,6 +1,6 @@
 import cv2
 import numpy as np
-from agent.analyzers.base import ExtractedData, FaceResult
+from agent.analyzers.base import FaceResult
 
 
 class FaceDetector:
@@ -29,8 +29,7 @@ class FaceDetector:
     def name(self) -> str:
         return "face"
 
-    def analyze(self, data: ExtractedData) -> FaceResult:
-        frames = data["frames"]
+    def analyze(self, frames: list) -> FaceResult:
         if not frames:
             return FaceResult(has_face=False, face_count=0, face_frame_ratio=0.0, max_confidence=0.0)
 

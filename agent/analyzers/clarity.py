@@ -1,6 +1,6 @@
 import cv2
 import numpy as np
-from agent.analyzers.base import ExtractedData, ClarityResult, ClarityDetail
+from agent.analyzers.base import ClarityResult, ClarityDetail
 
 # Normalisation caps: values above these map to score=1.0.
 # Using 95th-percentile estimates from natural scene datasets.
@@ -35,8 +35,7 @@ class ClarityAnalyzer:
     def name(self) -> str:
         return "clarity"
 
-    def analyze(self, data: ExtractedData) -> ClarityResult:
-        frames = data["frames"]
+    def analyze(self, frames: list) -> ClarityResult:
         if not frames:
             return ClarityResult(
                 score=0.0,

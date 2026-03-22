@@ -1,6 +1,6 @@
 import cv2
 import numpy as np
-from agent.analyzers.base import ExtractedData, ContinuityResult, ContinuityDetail
+from agent.analyzers.base import ContinuityResult, ContinuityDetail
 
 _DISCONTINUITY_THRESHOLD = 2.0  # pixels/frame — above this counts as a jump
 
@@ -29,8 +29,7 @@ class ContinuityAnalyzer:
     def name(self) -> str:
         return "continuity"
 
-    def analyze(self, data: ExtractedData) -> ContinuityResult:
-        frames = data["frames"]
+    def analyze(self, frames: list) -> ContinuityResult:
         if not frames:
             return ContinuityResult(
                 score=0.0,

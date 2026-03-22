@@ -1,6 +1,6 @@
 import cv2
 import numpy as np
-from agent.analyzers.base import ExtractedData, GaitResult
+from agent.analyzers.base import GaitResult
 
 
 class GaitDetector:
@@ -13,8 +13,7 @@ class GaitDetector:
     def name(self) -> str:
         return "gait"
 
-    def analyze(self, data: ExtractedData) -> GaitResult:
-        frames = data["frames"]
+    def analyze(self, frames: list) -> GaitResult:
         if not frames:
             return GaitResult(has_human_gait=False, person_frame_ratio=0.0, max_detection_weight=0.0)
 
