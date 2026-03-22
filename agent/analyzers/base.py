@@ -3,10 +3,11 @@ import numpy as np
 
 
 class ExtractedData(TypedDict):
-    frames: list[np.ndarray]              # BGR frames HxWxC uint8; may be []
-    audio_frames: list[bytes] | None      # 30ms PCM chunks, 16kHz mono int16; None if absent
-    sensor_series: dict[str, np.ndarray]  # topic → (T,D) float64; {} if absent
+    videos: dict[str, list[np.ndarray]]   # topic → BGR frame list
+    audios: dict[str, list[bytes]]         # topic → 30ms PCM frame list
+    sensor_series: dict[str, np.ndarray]   # shared across all topics
     duration_seconds: float
+    extraction_warnings: dict[str, str]    # topic → "below_min_frames" etc.
 
 
 class ClarityDetail(TypedDict):
@@ -18,47 +19,76 @@ class ClarityDetail(TypedDict):
 
 class ContinuityDetail(TypedDict):
     mean_flow_magnitude: float
-    flow_magnitude_std: float   # temporal jitter in motion speed
-    flow_direction_std: float   # spatial incoherence of motion vectors (radians)
+    flow_magnitude_std: float
+    flow_direction_std: float
     discontinuity_frames: int
     frame_count: int
 
 
 class ClarityResult(TypedDict):
-    score: float       # [0.0, 1.0]
-    method: str        # "laplacian+fft"
+    score: float
+    method: str
     detail: ClarityDetail
 
 
 class ContinuityResult(TypedDict):
-    score: float       # [0.0, 1.0]
-    method: str        # "optical_flow"
+    score: float
+    method: str
     detail: ContinuityDetail
 
 
 class FaceResult(TypedDict):
     has_face: bool
     face_count: int
-    face_frame_ratio: float   # frames_with_face / total_frames
-    max_confidence: float     # highest YuNet detection confidence score
+    face_frame_ratio: float
+    max_confidence: float
 
 
 class VoiceResult(TypedDict):
     has_human_voice: bool
-    speech_frame_ratio: float  # speech_frames / total_audio_frames
+    speech_frame_ratio: float
 
 
 class GaitResult(TypedDict):
     has_human_gait: bool
-    person_frame_ratio: float      # frames_with_person / total_frames
-    max_detection_weight: float    # highest HOG SVM weight (confidence proxy)
+    person_frame_ratio: float
+    max_detection_weight: float
 
 
-class Analyzer(Protocol):
-    def name(self) -> str:
-        """One of: "clarity" | "continuity" | "face" | "voice" | "gait" """
+class CameraResult(TypedDict):
+    topic: str
+    frame_count: int
+    clarity: ClarityResult
+    continuity: ContinuityResult
+    face: FaceResult
+    gait: GaitResult
+    llm_assessment: dict | None
+    llm_skipped_reason: str | None
+    passed: bool
+    failure_reasons: list[str]
+    analyzer_errors: list[str]
+
+
+class AudioResult(TypedDict):
+    topic: str
+    audio_frame_count: int
+    voice: VoiceResult
+    llm_assessment: dict | None
+    llm_skipped_reason: str | None
+    passed: bool
+    failure_reasons: list[str]
+    analyzer_errors: list[str]
+
+
+class VisualAnalyzer(Protocol):
+    def name(self) -> str: ...
+    def analyze(self, frames: list[np.ndarray]) -> ClarityResult | ContinuityResult | FaceResult | GaitResult:
+        """Must not raise. Handle empty frames gracefully."""
         ...
 
-    def analyze(self, data: ExtractedData) -> ClarityResult | ContinuityResult | FaceResult | VoiceResult | GaitResult:
-        """Must not raise. Handle empty frames gracefully."""
+
+class AudioAnalyzer(Protocol):
+    def name(self) -> str: ...
+    def analyze(self, audio_frames: list[bytes]) -> VoiceResult:
+        """Must not raise. Handle empty audio_frames gracefully."""
         ...

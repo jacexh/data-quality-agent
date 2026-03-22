@@ -6,84 +6,121 @@ from agent.analyzers.base import ExtractedData
 
 FIXTURES_DIR = pathlib.Path(__file__).parent / "fixtures"
 
+_CAM = "/camera/image_raw"
+_AUDIO = "/audio/data"
+
 
 def _make_sharp_frame(h: int = 64, w: int = 64) -> np.ndarray:
-    """Checkerboard pattern — high Laplacian variance."""
     frame = np.zeros((h, w, 3), dtype=np.uint8)
     frame[::4, :] = 255
     return frame
 
 
 def _make_blurry_frame(h: int = 64, w: int = 64) -> np.ndarray:
-    """Uniform grey — near-zero Laplacian variance."""
     return np.full((h, w, 3), 128, dtype=np.uint8)
 
 
 def _make_silent_pcm_frame() -> bytes:
-    """960 bytes of zero PCM = 30ms silence at 16kHz mono int16."""
     return b"\x00" * 960
 
 
 def _make_speech_pcm_frame(freq: int = 1000) -> bytes:
-    """30ms 1 kHz sine wave at 16 kHz mono int16 — detected as speech by WebRTC VAD."""
-    n = 480  # 480 samples = 30 ms @ 16 kHz
+    n = 480
     t = np.linspace(0, n / 16000, n, endpoint=False)
     samples = (16000 * np.sin(2 * np.pi * freq * t)).astype(np.int16)
     return samples.tobytes()
 
 
 @pytest.fixture
-def sharp_data() -> ExtractedData:
+def sharp_frames() -> list[np.ndarray]:
+    return [_make_sharp_frame() for _ in range(10)]
+
+
+@pytest.fixture
+def blurry_frames() -> list[np.ndarray]:
+    return [_make_blurry_frame() for _ in range(10)]
+
+
+@pytest.fixture
+def empty_frames() -> list[np.ndarray]:
+    return []
+
+
+@pytest.fixture
+def silent_audio() -> list[bytes]:
+    return [_make_silent_pcm_frame() for _ in range(5)]
+
+
+@pytest.fixture
+def speech_audio() -> list[bytes]:
+    return [_make_speech_pcm_frame() for _ in range(10)]
+
+
+@pytest.fixture
+def sharp_data(sharp_frames, silent_audio) -> ExtractedData:
     return ExtractedData(
-        frames=[_make_sharp_frame() for _ in range(10)],
-        audio_frames=[_make_silent_pcm_frame() for _ in range(5)],
+        videos={_CAM: sharp_frames},
+        audios={_AUDIO: silent_audio},
         sensor_series={},
         duration_seconds=5.0,
+        extraction_warnings={},
     )
 
 
 @pytest.fixture
-def blurry_data() -> ExtractedData:
+def blurry_data(blurry_frames) -> ExtractedData:
     return ExtractedData(
-        frames=[_make_blurry_frame() for _ in range(10)],
-        audio_frames=None,
+        videos={_CAM: blurry_frames},
+        audios={},
         sensor_series={},
         duration_seconds=5.0,
+        extraction_warnings={},
     )
 
 
 @pytest.fixture
 def empty_data() -> ExtractedData:
     return ExtractedData(
-        frames=[],
-        audio_frames=None,
+        videos={_CAM: []},
+        audios={},
         sensor_series={},
         duration_seconds=0.0,
+        extraction_warnings={},
     )
 
 
 @pytest.fixture
 def face_data() -> ExtractedData:
-    """Real face photo (lena.jpg) — YuNet should detect exactly one face."""
     img = cv2.imread(str(FIXTURES_DIR / "lena.jpg"))
     assert img is not None, "tests/fixtures/lena.jpg missing"
-    return ExtractedData(frames=[img], audio_frames=None, sensor_series={}, duration_seconds=1.0)
+    return ExtractedData(
+        videos={_CAM: [img]},
+        audios={},
+        sensor_series={},
+        duration_seconds=1.0,
+        extraction_warnings={},
+    )
 
 
 @pytest.fixture
 def person_data() -> ExtractedData:
-    """Street photo with full-body person — HOG should detect at least one pedestrian."""
     img = cv2.imread(str(FIXTURES_DIR / "person.jpg"))
     assert img is not None, "tests/fixtures/person.jpg missing"
-    return ExtractedData(frames=[img], audio_frames=None, sensor_series={}, duration_seconds=1.0)
+    return ExtractedData(
+        videos={_CAM: [img]},
+        audios={},
+        sensor_series={},
+        duration_seconds=1.0,
+        extraction_warnings={},
+    )
 
 
 @pytest.fixture
-def speech_data() -> ExtractedData:
-    """Frames with synthetic 1 kHz speech-band audio — WebRTC VAD should detect voice."""
+def speech_data(speech_audio) -> ExtractedData:
     return ExtractedData(
-        frames=[_make_sharp_frame() for _ in range(5)],
-        audio_frames=[_make_speech_pcm_frame() for _ in range(10)],
+        videos={_CAM: [_make_sharp_frame() for _ in range(5)]},
+        audios={_AUDIO: speech_audio},
         sensor_series={},
         duration_seconds=0.3,
+        extraction_warnings={},
     )
