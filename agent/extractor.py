@@ -33,117 +33,136 @@ def _safe_iter(reader: Any, topics: list[str]) -> Iterator[tuple[Any, Any, Any, 
             return
 
 
-class McapExtractor:
-    """Parses MCAP files and extracts frames, audio, and IMU data.
+_IMAGE_SCHEMAS = {"sensor_msgs/Image", "sensor_msgs/CompressedImage"}
+_AUDIO_SCHEMAS = {"audio_common_msgs/AudioData"}
+_IMU_SCHEMAS   = {"sensor_msgs/Imu"}
 
-    Supports ROS1 and ROS2 encodings. Auto-detects the camera topic if the
-    configured topic is absent in the file.
+
+class McapExtractor:
+    """Parses MCAP files and extracts frames, audio, and IMU data for all configured topics.
+
+    camera_topics / audio_topics:
+        - Non-empty list: extract only the listed topics present in the file.
+        - Empty list: auto-discover all image / audio topics found in the file.
     """
 
     def __init__(
         self,
-        camera_topic: str = "/camera/image_raw",
-        audio_topic: str = "/audio/data",
-        imu_topic: str = "/imu/data",
-        frame_sample_rate: int = 1,
+        camera_topics: list[str] | None = None,
+        audio_topics: list[str] | None = None,
+        frame_sample_rate: int = 5,
+        min_frames: int = 10,
+        max_frames_per_topic: int = 300,
         registry: SchemaDecoderRegistry | None = None,
     ) -> None:
-        self._camera_topic = camera_topic
-        self._audio_topic = audio_topic
-        self._imu_topic = imu_topic
+        self._camera_topics: list[str] = camera_topics if camera_topics is not None else []
+        self._audio_topics: list[str] = audio_topics if audio_topics is not None else []
         self._frame_sample_rate = max(1, frame_sample_rate)
+        self._min_frames = max(0, min_frames)
+        self._max_frames_per_topic = max(1, max_frames_per_topic)
         self._registry = registry if registry is not None else build_default_registry()
 
-    def _resolve_topics(self, mcap_path: str) -> tuple[str, str, str]:
-        """Return (camera_topic, audio_topic, imu_topic), auto-detecting camera topic if needed."""
+    def _resolve_topics(self, mcap_path: str) -> tuple[list[str], list[str], str | None]:
+        """Return (video_topics, audio_topics, imu_topic) to extract.
+
+        If the configured lists are non-empty, return only those topics that exist
+        in the file. If empty, auto-discover all image / audio topics from the file.
+        Topics are returned in sorted order for determinism.
+        """
         with open(mcap_path, "rb") as f:
             reader = make_reader(f)
             summary = reader.get_summary()
             channels = list(summary.channels.values()) if summary else []
+            schemas = summary.schemas if summary else {}
 
-        _IMAGE_SCHEMAS = {"sensor_msgs/Image", "sensor_msgs/CompressedImage"}
-        _AUDIO_SCHEMAS = {"audio_common_msgs/AudioData"}
-        _IMU_SCHEMAS   = {"sensor_msgs/Imu"}
+        def schema_name(ch) -> str:
+            s = schemas.get(ch.schema_id)
+            return s.name if s else ""
 
-        configured_topics = {self._camera_topic, self._audio_topic, self._imu_topic}
-        available_topics  = {ch.topic for ch in channels}
+        available_image = sorted(ch.topic for ch in channels if schema_name(ch) in _IMAGE_SCHEMAS)
+        available_audio = sorted(ch.topic for ch in channels if schema_name(ch) in _AUDIO_SCHEMAS)
+        available_imu   = sorted(ch.topic for ch in channels if schema_name(ch) in _IMU_SCHEMAS)
 
-        camera_topic = self._camera_topic
-        audio_topic  = self._audio_topic
-        imu_topic    = self._imu_topic
+        if self._camera_topics:
+            video_topics = [t for t in self._camera_topics if t in set(available_image)]
+        else:
+            video_topics = available_image
 
-        if camera_topic not in available_topics:
-            # Fall back to first image topic found in the file
-            for ch in channels:
-                schema_id = ch.schema_id
-                if summary:
-                    schema = summary.schemas.get(schema_id)
-                    schema_name = schema.name if schema else ""
-                    if schema_name in _IMAGE_SCHEMAS:
-                        camera_topic = ch.topic
-                        logger.info(
-                            "camera_topic {!r} not found; using {!r} instead",
-                            self._camera_topic, camera_topic,
-                        )
-                        break
+        if self._audio_topics:
+            audio_topics = [t for t in self._audio_topics if t in set(available_audio)]
+        else:
+            audio_topics = available_audio
 
-        return camera_topic, audio_topic, imu_topic
+        imu_topic = available_imu[0] if available_imu else None
+
+        return video_topics, audio_topics, imu_topic
 
     def extract(self, mcap_path: str) -> ExtractedData:
-        """Parse an MCAP file and return ExtractedData.
+        """Parse an MCAP file and return ExtractedData with per-topic video/audio dicts."""
+        video_topics, audio_topics, imu_topic = self._resolve_topics(mcap_path)
+        all_topics = video_topics + audio_topics + ([imu_topic] if imu_topic else [])
 
-        Auto-detects ROS1/ROS2 encoding. Handles both sensor_msgs/Image and
-        sensor_msgs/CompressedImage. Audio and IMU extraction unchanged.
-        Falls back to first available image topic if configured topic is absent.
-        """
-        raw_frames: list[np.ndarray] = []
-        _audio_buf = bytearray()
-        imu_rows: list[np.ndarray] = []
+        # Accumulate raw frames per topic
+        raw_videos: dict[str, list[np.ndarray]] = {t: [] for t in video_topics}
+        raw_audio_buf: dict[str, bytearray] = {t: bytearray() for t in audio_topics}
         timestamps: list[float] = []
+        imu_rows: list[np.ndarray] = []
 
-        camera_topic, audio_topic, imu_topic = self._resolve_topics(mcap_path)
-        topics = [camera_topic, audio_topic, imu_topic]
         decoder_factories = ProtocolReaderFactory.build_decoder_factories(mcap_path)
         with open(mcap_path, "rb") as f:
             reader = make_reader(f, decoder_factories=decoder_factories)
-            for schema, channel, message, decoded_message in _safe_iter(reader, topics):
+            for schema, channel, message, decoded_message in _safe_iter(reader, all_topics):
                 t = message.log_time / 1e9
                 timestamps.append(t)
                 topic = channel.topic
 
-                if topic == camera_topic:
+                if topic in raw_videos:
                     frame = self._registry.decode_image(schema.name, decoded_message)
                     if frame is not None:
-                        raw_frames.append(frame)
+                        raw_videos[topic].append(frame)
 
-                elif topic == audio_topic:
+                elif topic in raw_audio_buf:
                     chunk = self._registry.decode_audio(schema.name, decoded_message)
                     if chunk:
-                        _audio_buf.extend(chunk)
+                        raw_audio_buf[topic].extend(chunk)
 
-                elif topic == imu_topic:
+                elif imu_topic and topic == imu_topic:
                     row = self._registry.decode_imu(schema.name, decoded_message)
                     if row is not None:
                         imu_rows.append(row)
 
-        # Apply frame sampling: keep every Nth frame, always keep at least 1 if any exist
-        if raw_frames:
-            frames = raw_frames[::self._frame_sample_rate]
-            if not frames:
-                frames = [raw_frames[0]]
-        else:
-            frames = []
+        # Post-loop: per-topic 3-step sampling for videos
+        extraction_warnings: dict[str, str] = {}
+        videos: dict[str, list[np.ndarray]] = {}
+        for topic, frames in raw_videos.items():
+            frames = frames[::self._frame_sample_rate]  # step 1: frame_sample_rate thinning
+            if len(frames) > self._max_frames_per_topic:  # step 2: hard cap
+                indices = np.linspace(0, len(frames) - 1, self._max_frames_per_topic, dtype=int)
+                frames = [frames[i] for i in indices]
+            if 0 < len(frames) < self._min_frames:  # step 3: min_frames check
+                logger.warning(
+                    "Topic {} has only {} frames after sampling — treated as empty",
+                    topic, len(frames),
+                )
+                extraction_warnings[topic] = "below_min_frames"
+                frames = []
+            videos[topic] = frames
+
+        # Post-loop: convert audio buffers to PCM frame lists (no sub-sampling)
+        audios: dict[str, list[bytes]] = {}
+        for topic, buf in raw_audio_buf.items():
+            raw = bytes(buf)
+            audios[topic] = chunk_pcm(raw) if raw else []
 
         duration = (max(timestamps) - min(timestamps)) if len(timestamps) >= 2 else 0.0
-        raw_audio = bytes(_audio_buf)
-        audio_frames = chunk_pcm(raw_audio) if raw_audio else None
-        sensor_series = {}
-        if imu_rows:
-            sensor_series[self._imu_topic] = np.array(imu_rows, dtype=np.float64)
+        sensor_series: dict[str, np.ndarray] = {}
+        if imu_rows and imu_topic:
+            sensor_series[imu_topic] = np.array(imu_rows, dtype=np.float64)
 
         return ExtractedData(
-            frames=frames,
-            audio_frames=audio_frames,
+            videos=videos,
+            audios=audios,
             sensor_series=sensor_series,
             duration_seconds=duration,
+            extraction_warnings=extraction_warnings,
         )
