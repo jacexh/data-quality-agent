@@ -105,6 +105,7 @@ class McapExtractor:
         # Stream-sample frames during iteration to avoid accumulating all raw frames
         frame_counters: dict[str, int] = {t: 0 for t in video_topics}
         videos: dict[str, list[np.ndarray]] = {t: [] for t in video_topics}
+        full_topics: set[str] = set()
         raw_audio_buf: dict[str, bytearray] = {t: bytearray() for t in audio_topics}
         timestamps: list[float] = []
         imu_rows: list[np.ndarray] = []
@@ -117,14 +118,14 @@ class McapExtractor:
                 timestamps.append(t)
                 topic = channel.topic
 
-                if topic in videos:
+                if topic in videos and topic not in full_topics:
                     frame_counters[topic] += 1
-                    # Keep if: this is a sample frame (0-indexed modulo) AND not yet at cap
-                    if ((frame_counters[topic] - 1) % self._frame_sample_rate == 0
-                            and len(videos[topic]) < self._max_frames_per_topic):
+                    if (frame_counters[topic] - 1) % self._frame_sample_rate == 0:
                         frame = self._registry.decode_image(schema.name, decoded_message)
                         if frame is not None:
                             videos[topic].append(frame)
+                            if len(videos[topic]) >= self._max_frames_per_topic:
+                                full_topics.add(topic)
 
                 elif topic in raw_audio_buf:
                     chunk = self._registry.decode_audio(schema.name, decoded_message)
