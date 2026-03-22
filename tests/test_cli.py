@@ -9,16 +9,16 @@ PASSING_REPORT = {
     "minio_bucket": "",
     "analyzed_at": "2026-01-01T00:00:00Z",
     "duration_seconds": 5.0,
-    "scores": None,
-    "sensitive_info": None,
-    "llm_assessment": None,
-    "llm_skipped_reason": "all_detectors_clear_no_borderline_scores",
-    "analyzer_errors": [],
-    "passed": True,
+    "camera_pass_strategy": "all",
+    "audio_pass_strategy": "all",
+    "cameras": [],
+    "audios": [],
+    "overall_passed": True,
     "failure_reasons": [],
+    "analyzer_errors": [],
 }
 
-FAILING_REPORT = {**PASSING_REPORT, "passed": False, "failure_reasons": ["clarity"]}
+FAILING_REPORT = {**PASSING_REPORT, "overall_passed": False, "failure_reasons": ["duration_too_short"]}
 
 
 def _run_cli(argv, mock_report=None):
@@ -50,7 +50,7 @@ def test_analyze_passing_file_exits_0(tmp_path):
     out, code = _run_cli(["analyze", str(mcap)], mock_report=PASSING_REPORT)
     assert code == 0
     report = json.loads(out)
-    assert report["passed"] is True
+    assert report["overall_passed"] is True
 
 
 def test_analyze_failing_file_exits_1(tmp_path):
@@ -59,7 +59,7 @@ def test_analyze_failing_file_exits_1(tmp_path):
     out, code = _run_cli(["analyze", str(mcap)], mock_report=FAILING_REPORT)
     assert code == 1
     report = json.loads(out)
-    assert report["passed"] is False
+    assert report["overall_passed"] is False
 
 
 def test_output_is_valid_json(tmp_path):
@@ -67,7 +67,7 @@ def test_output_is_valid_json(tmp_path):
     mcap.write_bytes(b"fake")
     out, _ = _run_cli(["analyze", str(mcap)])
     parsed = json.loads(out)
-    assert "passed" in parsed
+    assert "overall_passed" in parsed
     assert "source_file" in parsed
 
 

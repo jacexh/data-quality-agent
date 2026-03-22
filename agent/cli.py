@@ -34,4 +34,4 @@ def main() -> None:
 
     report = analyze_local_file(path)
     print(json.dumps(report, ensure_ascii=False, indent=2))
-    sys.exit(0 if report["passed"] else 1)
+    sys.exit(0 if report["overall_passed"] else 1)
