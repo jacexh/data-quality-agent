@@ -1,4 +1,6 @@
 import warnings
+from typing import Literal
+
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -28,6 +30,14 @@ class Settings(BaseSettings):
     max_queue_size: int = Field(default=100, gt=0)
     worker_count: int = Field(default=4, gt=0)
     frame_sample_rate: int = Field(default=30, gt=0)
+
+    camera_topics: list[str] = []
+    audio_topics: list[str] = []
+    camera_pass_strategy: Literal["all", "any", "majority"] = "all"
+    audio_pass_strategy: Literal["all", "any", "majority"] = "all"
+    max_frames_per_topic: int = Field(default=300, gt=0)
+    max_concurrent_topics: int = Field(default=4, gt=0)
+    llm_max_concurrent_calls: int = Field(default=4, gt=0)
 
     @model_validator(mode="after")
     def warn_if_no_api_key(self) -> "Settings":
