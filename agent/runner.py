@@ -182,7 +182,8 @@ def analyze_local_file(local_path: str, source_file: str = "", bucket: str = "")
     # Detection phase: per-topic ThreadPoolExecutor (OpenCV releases GIL, no IPC needed)
     with ThreadPoolExecutor(max_workers=settings.max_concurrent_topics) as executor:
         cam_futures = {
-            executor.submit(_run_visual_worker, topic, frames, _model_path): topic
+            executor.submit(_run_visual_worker, topic, frames, _model_path,
+                            settings.max_analysis_dim): topic
             for topic, frames in data["videos"].items()
             if frames and topic not in camera_intermediates
         }

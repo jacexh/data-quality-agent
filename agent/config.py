@@ -36,6 +36,7 @@ class Settings(BaseSettings):
     camera_pass_strategy: Literal["all", "any", "majority"] = "all"
     audio_pass_strategy: Literal["all", "any", "majority"] = "all"
     max_frames_per_topic: int = Field(default=300, gt=0)
+    max_analysis_dim: int = Field(default=640, gt=0)
     max_concurrent_topics: int = Field(default=4, gt=0)
     llm_max_concurrent_calls: int = Field(default=4, gt=0)
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
+import cv2
 import numpy as np
 from loguru import logger
 from agent.analyzers.base import VisualAnalyzer, AudioAnalyzer
@@ -45,10 +46,28 @@ class AnalysisPipeline:
 
 # ── Picklable top-level workers for ProcessPoolExecutor dispatch ────────────
 
+def _resize_frames(frames: list[np.ndarray], max_dim: int) -> list[np.ndarray]:
+    """Resize frames so max(h, w) <= max_dim. Returns new list; does not mutate input."""
+    if max_dim <= 0:
+        return frames
+    resized = []
+    for f in frames:
+        h, w = f.shape[:2]
+        if max(h, w) <= max_dim:
+            resized.append(f)
+        else:
+            scale = max_dim / max(h, w)
+            new_w = max(1, int(w * scale))
+            new_h = max(1, int(h * scale))
+            resized.append(cv2.resize(f, (new_w, new_h), interpolation=cv2.INTER_AREA))
+    return resized
+
+
 def _run_visual_worker(
     topic: str,
     frames: list[np.ndarray],
     model_path: str,
+    max_analysis_dim: int = 640,
 ) -> tuple[str, dict[str, Any], list[str]]:
     """Per-topic visual detection worker. Runs in a separate process.
 
@@ -61,6 +80,8 @@ def _run_visual_worker(
     from agent.analyzers.face import FaceDetector
     from agent.analyzers.gait import GaitDetector
 
+    analysis_frames = _resize_frames(frames, max_analysis_dim)
+
     pipeline = AnalysisPipeline(
         visual_analyzers=[
             ClarityAnalyzer(),
@@ -70,7 +91,7 @@ def _run_visual_worker(
         ],
         audio_analyzers=[],
     )
-    results, errors = pipeline.run_visual(frames)
+    results, errors = pipeline.run_visual(analysis_frames)
     return topic, results, errors
 
 
