@@ -27,7 +27,7 @@ class GaitDetector:
                 continue
             eligible += 1
             rects, weights = self._hog.detectMultiScale(
-                frame, winStride=(8, 8), padding=(4, 4), scale=1.05
+                frame, winStride=(12, 12), padding=(6, 6), scale=1.05
             )
             if len(rects) > 0:
                 frames_with_person += 1
