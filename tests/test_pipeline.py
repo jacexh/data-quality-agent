@@ -1,41 +1,60 @@
 import pytest
+import numpy as np
 from agent.pipeline import AnalysisPipeline
-from agent.analyzers.base import ExtractedData
 
 
-class _OkAnalyzer:
+class _OkVisualAnalyzer:
     def name(self) -> str:
-        return "ok"
+        return "ok_visual"
 
-    def analyze(self, data):
+    def analyze(self, frames: list[np.ndarray]):
         return {"value": 42}
 
 
-class _BrokenAnalyzer:
+class _BrokenVisualAnalyzer:
     def name(self) -> str:
         return "broken"
 
-    def analyze(self, data):
+    def analyze(self, frames: list[np.ndarray]):
         raise RuntimeError("oops")
 
 
-def test_all_analyzers_run(sharp_data):
-    pipeline = AnalysisPipeline(analyzers=[_OkAnalyzer()])
-    results, errors = pipeline.run(sharp_data)
-    assert results["ok"] == {"value": 42}
+class _OkAudioAnalyzer:
+    def name(self) -> str:
+        return "ok_audio"
+
+    def analyze(self, audio_frames: list[bytes]):
+        return {"value": 99}
+
+
+def test_run_visual_returns_results():
+    pipeline = AnalysisPipeline(visual_analyzers=[_OkVisualAnalyzer()], audio_analyzers=[])
+    frames = [np.zeros((64, 64, 3), dtype=np.uint8)]
+    results, errors = pipeline.run_visual(frames)
+    assert results["ok_visual"] == {"value": 42}
     assert errors == []
 
 
-def test_broken_analyzer_does_not_abort_others(sharp_data):
-    pipeline = AnalysisPipeline(analyzers=[_OkAnalyzer(), _BrokenAnalyzer()])
-    results, errors = pipeline.run(sharp_data)
-    assert results["ok"] == {"value": 42}
+def test_run_visual_broken_analyzer_does_not_abort_others():
+    pipeline = AnalysisPipeline(
+        visual_analyzers=[_OkVisualAnalyzer(), _BrokenVisualAnalyzer()],
+        audio_analyzers=[],
+    )
+    results, errors = pipeline.run_visual([np.zeros((64, 64, 3), dtype=np.uint8)])
+    assert results["ok_visual"] == {"value": 42}
     assert results["broken"] is None
     assert "broken" in errors
 
 
-def test_all_broken_returns_all_none(sharp_data):
-    pipeline = AnalysisPipeline(analyzers=[_BrokenAnalyzer()])
-    results, errors = pipeline.run(sharp_data)
-    assert results["broken"] is None
-    assert errors == ["broken"]
+def test_run_audio_returns_results():
+    pipeline = AnalysisPipeline(visual_analyzers=[], audio_analyzers=[_OkAudioAnalyzer()])
+    results, errors = pipeline.run_audio([b"\x00" * 960])
+    assert results["ok_audio"] == {"value": 99}
+    assert errors == []
+
+
+def test_run_audio_empty_input():
+    pipeline = AnalysisPipeline(visual_analyzers=[], audio_analyzers=[_OkAudioAnalyzer()])
+    results, errors = pipeline.run_audio([])
+    assert results["ok_audio"] == {"value": 99}  # analyzer handles empty gracefully
+    assert errors == []
