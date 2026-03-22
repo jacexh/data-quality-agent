@@ -1,7 +1,6 @@
 import pytest
 import numpy as np
 from agent.analyzers.voice import VoiceDetector
-from agent.analyzers.base import ExtractedData
 
 
 def _make_speech_frame(freq: int = 1000) -> bytes:
@@ -15,31 +14,30 @@ def _make_silent_frame() -> bytes:
     return b"\x00" * 960
 
 
-def test_silent_pcm_no_voice(sharp_data):
+def test_silent_pcm_no_voice(silent_audio):
     """All-zero PCM frames are silence → no voice."""
     detector = VoiceDetector()
-    result = detector.analyze(sharp_data)
+    result = detector.analyze(silent_audio)
     assert result["has_human_voice"] is False
 
 
-def test_none_audio_no_voice(empty_data):
+def test_none_audio_no_voice():
     detector = VoiceDetector()
-    result = detector.analyze(empty_data)
+    result = detector.analyze([])
     assert result["has_human_voice"] is False
 
 
-def test_speech_band_audio_detected(speech_data):
+def test_speech_band_audio_detected(speech_audio):
     """1 kHz sine wave (speech frequency band) must be detected as voice (positive recall test)."""
     detector = VoiceDetector()
-    result = detector.analyze(speech_data)
+    result = detector.analyze(speech_audio)
     assert result["has_human_voice"] is True
 
 
 def test_empty_audio_frames_list_no_voice():
     """Empty list [] (distinct from None) — falsy, must also return no voice."""
-    data = ExtractedData(frames=[], audio_frames=[], sensor_series={}, duration_seconds=0.0)
     detector = VoiceDetector()
-    result = detector.analyze(data)
+    result = detector.analyze([])
     assert result["has_human_voice"] is False
 
 
@@ -47,20 +45,20 @@ def test_name():
     assert VoiceDetector().name() == "voice"
 
 
-def test_speech_frame_ratio_zero_for_silence(sharp_data):
+def test_speech_frame_ratio_zero_for_silence(silent_audio):
     """All silence → ratio = 0.0."""
-    result = VoiceDetector().analyze(sharp_data)
+    result = VoiceDetector().analyze(silent_audio)
     assert result["speech_frame_ratio"] == pytest.approx(0.0)
 
 
-def test_speech_frame_ratio_zero_for_no_audio(empty_data):
-    result = VoiceDetector().analyze(empty_data)
+def test_speech_frame_ratio_zero_for_no_audio():
+    result = VoiceDetector().analyze([])
     assert result["speech_frame_ratio"] == pytest.approx(0.0)
 
 
-def test_speech_frame_ratio_one_for_all_speech(speech_data):
+def test_speech_frame_ratio_one_for_all_speech(speech_audio):
     """All speech frames → ratio = 1.0."""
-    result = VoiceDetector().analyze(speech_data)
+    result = VoiceDetector().analyze(speech_audio)
     assert result["speech_frame_ratio"] == pytest.approx(1.0)
 
 
@@ -73,6 +71,5 @@ def test_speech_frame_ratio_partial():
     """
     frames = [_make_speech_frame() for _ in range(3)] + \
              [_make_silent_frame() for _ in range(7)]
-    data = ExtractedData(frames=[], audio_frames=frames, sensor_series={}, duration_seconds=0.5)
-    result = VoiceDetector().analyze(data)
+    result = VoiceDetector().analyze(frames)
     assert 0.0 < result["speech_frame_ratio"] < 1.0

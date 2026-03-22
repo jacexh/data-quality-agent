@@ -1,9 +1,9 @@
 import webrtcvad
 from loguru import logger
-from agent.analyzers.base import ExtractedData, VoiceResult
+from agent.analyzers.base import VoiceResult
 
 _SAMPLE_RATE = 16000
-_VAD_MODE = 2  # aggressiveness 0-3; 2 = balanced
+_VAD_MODE = 2
 
 
 class VoiceDetector:
@@ -15,8 +15,7 @@ class VoiceDetector:
     def name(self) -> str:
         return "voice"
 
-    def analyze(self, data: ExtractedData) -> VoiceResult:
-        audio_frames = data["audio_frames"]
+    def analyze(self, audio_frames: list[bytes]) -> VoiceResult:
         if not audio_frames:
             return VoiceResult(has_human_voice=False, speech_frame_ratio=0.0)
 
