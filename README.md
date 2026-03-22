@@ -23,34 +23,115 @@ MinIO 存储桶上传触发 webhook → 有界队列 + 多 worker 并发下载 �
 agent/
 ├── main.py          # FastAPI：POST /notify（webhook）, GET /health
 ├── cli.py           # CLI 入口：agent-cli analyze <file.mcap>
-├── runner.py        # 共享分析逻辑：analyze_local_file()，Server 和 CLI 共用
+├── runner.py        # 共享分析逻辑：analyze_local_file()，Server 和 CLI 共用；
+│                    # 检测阶段用 ThreadPoolExecutor（OpenCV 释放 GIL，无需跨进程 IPC）
 ├── config.py        # Pydantic Settings，从 .env 读取
-├── extractor.py     # McapExtractor：.mcap → ExtractedData（帧/音频/传感器）
-├── pipeline.py      # AnalysisPipeline：ThreadPoolExecutor 并发运行 5 个检测器
+├── extractor.py     # McapExtractor：.mcap → ExtractedData；流式帧采样（循环内计数器，
+│                    # 达到 max_frames_per_topic 立即停止 decode，避免全量帧驻留内存）
+├── pipeline.py      # AnalysisPipeline：ThreadPoolExecutor 并发运行检测器；
+│                    # _resize_frames() 在分析前将帧缩至 max_analysis_dim，原始帧保留给 LLM
 ├── llm_judge.py     # LLMJudge：Claude tool_use 循环，最多 5 轮
 ├── report.py        # ReportBuilder：合并结果 → JSON 报告
 └── analyzers/
     ├── base.py      # Analyzer Protocol + TypedDicts（ExtractedData, Results）
-    ├── clarity.py   # 图像清晰度
-    ├── continuity.py# 运动连续性
-    ├── face.py      # 人脸检测
-    ├── voice.py     # 人声检测
-    └── gait.py      # 步态检测
+    ├── clarity.py   # 图像清晰度（Laplacian + FFT）
+    ├── continuity.py# 运动连续性（Farneback 光流）
+    ├── face.py      # 人脸检测（YuNet ONNX）
+    ├── voice.py     # 人声检测（WebRTC VAD）
+    └── gait.py      # 步态检测（HOG + SVM）
 ```
 
-**数据流：**
+**完整处理流程：**
 
-```
-MinIO S3 事件
-    └─→ POST /notify
-            ├─→ 重复检测（_processing set）→ 200 duplicate
-            ├─→ 队列已满（asyncio.Queue）→ 429 queue_full
-            └─→ 入队成功 → 200 accepted
-                    └─→ Worker（per-worker S3 客户端，asyncio.to_thread）
-                            └─→ McapExtractor（帧采样 + 音频提取）
-                                    └─→ AnalysisPipeline（5 个检测器并发）
-                                            └─→ LLMJudge（按需调用 Claude）
-                                                    └─→ ReportBuilder → loguru JSON 输出
+```mermaid
+flowchart TD
+    classDef io fill:#dbeafe,stroke:#3b82f6
+    classDef proc fill:#dcfce7,stroke:#16a34a
+    classDef decision fill:#fef9c3,stroke:#ca8a04
+    classDef llm fill:#fae8ff,stroke:#a855f7
+    classDef error fill:#fee2e2,stroke:#ef4444
+
+    subgraph INPUT["入口层"]
+        direction LR
+        A1["MinIO Webhook\nPOST /notify"]:::io
+        A2["CLI\nagent-cli analyze &lt;file&gt;"]:::io
+        A1 --> Q["有界队列\nasyncio.Queue\n(max_queue_size)"]
+        Q --> W["Worker\nasyncio.to_thread\n(worker_count)"]
+        W --> RUN
+        A2 --> RUN["runner.analyze_local_file()"]
+    end
+
+    RUN --> EXT
+
+    subgraph EXT["McapExtractor.extract()"]
+        direction TB
+        E1["_resolve_topics()\n① 读 MCAP Summary\n② 匹配 Image/Audio/IMU schema\n③ 配置 topic 不存在时自动回落"]:::proc
+        E1 --> E2["流式迭代消息\n_safe_iter() — 跳过无 decoder 的消息"]:::proc
+        E2 --> E3{{"消息类型"}}:::decision
+
+        E3 -->|"Image /\nCompressedImage"| EV["decode_image()\n流式帧计数器采样\n① 每 frame_sample_rate 帧保留 1 帧\n② 超 max_frames_per_topic 即停\n③ 不足 min_frames → 警告+丢弃"]:::proc
+        E3 -->|"AudioData"| EA["decode_audio()\n累积 PCM 字节\n→ chunk_pcm()\n切 30ms 帧 (960B @16kHz)"]:::proc
+        E3 -->|"IMU"| EI["decode_imu()\n追加 [ax,ay,az,gx,gy,gz] 行\n→ sensor_series ndarray"]:::proc
+    end
+
+    EXT -->|"ExtractedData\nvideos / audios / sensor_series"| DET
+
+    subgraph DET["检测阶段 — ThreadPoolExecutor (max_concurrent_topics)"]
+        direction LR
+
+        subgraph VW["Visual Worker  ×  N camera topics"]
+            direction TB
+            V1["ClarityAnalyzer\nLaplacian方差 + FFT高频比\n→ score [0,1]"]:::proc
+            V2["ContinuityAnalyzer\nFarneback 光流\n→ score [0,1]"]:::proc
+            V3["FaceDetector\nYuNet ONNX\n→ has_face / confidence"]:::proc
+            V4["GaitDetector\nHOG + SVM\n→ has_human_gait / ratio"]:::proc
+        end
+
+        subgraph AW["Audio Worker  ×  M audio topics"]
+            V5["VoiceDetector\nWebRTC VAD\n→ has_human_voice / ratio"]:::proc
+        end
+
+        VW -.-|"ThreadPoolExecutor\n(内部并发4个分析器)"| VW
+    end
+
+    DET --> SH{{"should_invoke_llm?\n① has_face / has_voice / has_gait\n② clarity or continuity score\n   在阈值 ±0.1 边界内"}}:::decision
+
+    SH -->|"否 — 结果明确"| SKIP["跳过 LLM\nllm_skipped_reason 记录原因"]:::proc
+    SH -->|"是 — 需要裁决"| LLM
+
+    subgraph LLM["LLM 裁决阶段 — ThreadPoolExecutor (llm_max_concurrent_calls)"]
+        direction TB
+        L1["LLMJudge.judge()\nClaude claude-sonnet-4-6\ntool_use 循环 最多 5 轮"]:::llm
+        L1 --> L2{{"API 正常?"}}:::decision
+        L2 -->|"否"| LF["降级回退\n使用检测器结果\nllm_error 记录"]:::error
+        L2 -->|"是"| L3{{"LLM 判定"}}:::decision
+        L3 -->|"passed=True"| LP["覆盖: passed=True\n清空 failure_reasons"]:::llm
+        L3 -->|"passed=False"| LN["覆盖: passed=False\n保留 failure_reasons"]:::llm
+    end
+
+    SKIP --> AS
+    LF --> AS
+    LP --> AS
+    LN --> AS
+
+    subgraph AS["结果装配"]
+        direction LR
+        AC["_build_camera_result()\nclarity + continuity + face + gait\n→ CameraResult"]:::proc
+        AA["_build_audio_result()\nvoice\n→ AudioResult"]:::proc
+    end
+
+    AS --> RB
+
+    subgraph RB["ReportBuilder.build()"]
+        direction TB
+        RB1["camera_results\n按 camera_pass_strategy\nall / any / majority"]:::proc
+        RB2["audio_results\n按 audio_pass_strategy\nall / any / majority"]:::proc
+        RB1 & RB2 --> RB3["JSON 报告\npassed / failure_reasons\nper-topic 详情 + LLM 评估"]:::proc
+    end
+
+    RB3 --> OUT{{"输出模式"}}:::decision
+    OUT -->|"Server 模式"| O1["loguru JSON → stdout\n退出码 —"]:::io
+    OUT -->|"CLI 模式"| O2["stdout JSON\n退出码 0=合格 1=不合格 2=错误"]:::io
 ```
 
 ## 快速开始
@@ -138,6 +219,9 @@ docker-compose down
 | `MAX_QUEUE_SIZE` | `100` | 每实例有界队列容量，超出返回 429 |
 | `WORKER_COUNT` | `4` | 每实例并发 worker 数量 |
 | `FRAME_SAMPLE_RATE` | `30` | 视觉检测帧采样率（每 N 帧取 1 帧） |
+| `MAX_FRAMES_PER_TOPIC` | `300` | 每个 topic 采样帧数上限，达到后立即停止 decode |
+| `MAX_ANALYSIS_DIM` | `640` | 分析用帧的最大边长（像素），超出则等比缩放；原始分辨率帧仍用于 LLM 裁决；`0` = 不限制 |
+| `MAX_CONCURRENT_TOPICS` | `4` | 检测阶段并发 topic 数（ThreadPoolExecutor workers） |
 
 ## API
 

@@ -34,8 +34,10 @@ agent/
 ├── runner.py        # 共享分析逻辑：analyze_local_file()，Server 和 CLI 共用
 ├── config.py        # Pydantic Settings，从 .env 读取
 ├── extractor.py     # McapExtractor: .mcap → ExtractedData (帧/音频/传感器)
+│                    # 流式帧采样：循环内计数器，达到 max_frames_per_topic 即停止 decode
 ├── mcap_codecs.py   # ProtocolReaderFactory（ROS1/ROS2 自动检测）+ SchemaDecoderRegistry
-├── pipeline.py      # AnalysisPipeline: ThreadPoolExecutor 并发运行 5 个检测器
+├── pipeline.py      # AnalysisPipeline: ThreadPoolExecutor 并发运行检测器
+│                    # _resize_frames(): 分析前等比缩放到 max_analysis_dim，原始帧不变
 ├── llm_judge.py     # LLMJudge: Claude tool_use 循环，最多 5 轮
 ├── report.py        # ReportBuilder: 合并结果 → JSON 报告
 └── analyzers/
@@ -51,6 +53,11 @@ agent/
 
 **CLI 数据流：** `agent-cli analyze <file>` → runner.analyze_local_file →（同上）→ stdout JSON
 
+**并发模型：**
+- 检测阶段：`ThreadPoolExecutor(max_concurrent_topics)` — OpenCV 重型运算（Farneback/HOG/YuNet/FFT）均释放 GIL，线程间真正并发，无跨进程 IPC 开销
+- LLM 裁决阶段：`ThreadPoolExecutor(llm_max_concurrent_calls)` — 并发调用 Claude API
+- 内层 per-topic：`ThreadPoolExecutor` 并发运行 clarity/continuity/face/gait 四个检测器
+
 ## Environment Setup
 
 复制 `.env.example` 为 `.env`，必填项：
@@ -65,6 +72,9 @@ agent/
 - **错误隔离**: 一个检测器失败不中止其他检测器（`analyzer_errors` 字段记录）
 - **LLM 降级**: Claude API 异常时自动回退到检测器结果，不影响报告输出
 - **音频预分帧**: 音频已在 extractor 中切成 30ms PCM 帧（960 bytes @ 16kHz mono int16）再传给检测器
+- **流式帧采样**: extractor 在消息迭代循环内用 `(counter-1) % sample_rate == 0` 按需 decode；达到 `max_frames_per_topic` 后该 topic 进入 `full_topics` 集合，后续消息直接跳过，内存始终只保留采样帧
+- **分析分辨率与 LLM 分辨率分离**: `pipeline._resize_frames()` 在 worker 内将帧缩至 `max_analysis_dim`（默认 640px）再送入 CV 检测器；`camera_intermediates["frames"]` 保存原始分辨率帧供 LLM judge 使用，两者互不影响
+- **ThreadPoolExecutor 用于检测阶段**: OpenCV 的 Farneback/HOG/YuNet/Laplacian/FFT 均在 C++ 层释放 GIL，线程池即可实现 CPU 并发；避免了 ProcessPoolExecutor 的 numpy 数组 pickle 序列化（300 帧 1080p ≈ 1.8 GB/topic IPC 负载）
 - **HOG 最小尺寸**: 帧小于 128×64 像素时 GaitDetector 跳过处理
 - **模型文件**: `models/yunet.onnx`（~233 KB）已内置，无需运行时下载
 - **MCAP 解码层 (mcap_codecs.py)**：`ProtocolReaderFactory` 自动检测文件内编码（ros1msg/cdr/ros1/ros2 均支持），`SchemaDecoderRegistry` 按 schema 名分发解码函数；两者解耦便于扩展新格式
