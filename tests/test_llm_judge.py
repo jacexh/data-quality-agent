@@ -2,7 +2,6 @@ import base64
 import pytest
 from unittest.mock import MagicMock, patch
 from agent.llm_judge import LLMJudge, should_invoke_llm
-from agent.analyzers.base import ExtractedData
 import numpy as np
 
 
@@ -40,23 +39,25 @@ def test_should_invoke_on_cross_modal_ambiguity():
     assert should_invoke_llm(results, clarity_threshold=0.6, continuity_threshold=0.6, margin=0.1) is True
 
 
-def test_llm_failure_falls_back_to_detector_verdict(sharp_data):
+def test_llm_failure_falls_back_to_detector_verdict(sharp_frames):
     """If Anthropic API raises, LLMJudge returns None assessment and 'llm' error."""
-    judge = LLMJudge(api_key="fake", model="claude-sonnet-4-6", clarity_threshold=0.6, continuity_threshold=0.6, margin=0.1)
+    judge = LLMJudge(api_key="fake", model="claude-sonnet-4-6",
+                     clarity_threshold=0.6, continuity_threshold=0.6, margin=0.1)
     results = _make_detector_results(has_face=True)
 
     with patch("agent.llm_judge.anthropic.Anthropic") as mock_client_cls:
         mock_client_cls.return_value.messages.create.side_effect = RuntimeError("API down")
-        assessment, error = judge.judge(results, sharp_data)
+        assessment, error = judge.judge("/cam", results, sharp_frames, None, {})
 
     assert assessment is None
     assert error == "llm"
 
 
-def test_llm_skipped_returns_none_assessment_and_no_error(sharp_data):
-    judge = LLMJudge(api_key="fake", model="claude-sonnet-4-6", clarity_threshold=0.6, continuity_threshold=0.6, margin=0.1)
-    results = _make_detector_results()  # all clear → should skip
-    assessment, error = judge.judge(results, sharp_data)
+def test_llm_skipped_returns_none_assessment_and_no_error(sharp_frames):
+    judge = LLMJudge(api_key="fake", model="claude-sonnet-4-6",
+                     clarity_threshold=0.6, continuity_threshold=0.6, margin=0.1)
+    results = _make_detector_results()
+    assessment, error = judge.judge("/cam", results, sharp_frames, None, {})
     assert assessment is None
     assert error is None
 
@@ -88,18 +89,19 @@ def test_score_at_exact_threshold_triggers_llm():
 
 # ── LLM agent error paths ──────────────────────────────────────────────────
 
-def test_llm_max_rounds_exceeded_returns_llm_error(sharp_data):
+def test_llm_max_rounds_exceeded_returns_llm_error(sharp_frames):
     """Agent that only returns tool_use forever hits 5-round limit → (None, 'llm')."""
-    judge = LLMJudge(api_key="fake", model="claude-sonnet-4-6", clarity_threshold=0.6, continuity_threshold=0.6, margin=0.1)
+    judge = LLMJudge(api_key="fake", model="claude-sonnet-4-6",
+                     clarity_threshold=0.6, continuity_threshold=0.6, margin=0.1)
     results = _make_detector_results(has_face=True)
 
     mock_response = MagicMock()
     mock_response.stop_reason = "tool_use"
-    mock_response.content = []  # no tool_use blocks → tool_results=[], loop never exits
+    mock_response.content = []
 
     with patch("agent.llm_judge.anthropic.Anthropic") as mock_client_cls:
         mock_client_cls.return_value.messages.create.return_value = mock_response
-        assessment, error = judge.judge(results, sharp_data)
+        assessment, error = judge.judge("/cam", results, sharp_frames, None, {})
 
     assert assessment is None
     assert error == "llm"

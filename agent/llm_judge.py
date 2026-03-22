@@ -7,7 +7,6 @@ import anthropic
 import cv2
 import numpy as np
 from loguru import logger
-from agent.analyzers.base import ExtractedData
 
 _SYSTEM_PROMPT = """You are a data quality judge for robot-collected MCAP recordings.
 
@@ -86,8 +85,11 @@ class LLMJudge:
 
     def judge(
         self,
+        topic: str,
         detector_results: dict[str, Any],
-        data: ExtractedData,
+        frames: list[np.ndarray] | None,
+        audio_frames: list[bytes] | None,
+        sensor_series: dict[str, np.ndarray],
     ) -> tuple[dict[str, Any] | None, str | None]:
         """Run LLM judgment if warranted.
 
@@ -102,19 +104,17 @@ class LLMJudge:
             return None, None
 
         try:
-            return self._run_agent(detector_results, data), None
+            return self._run_agent(detector_results, frames or [], sensor_series), None
         except Exception as exc:
-            logger.warning("LLM judge failed, falling back to detector results: {}", exc)
+            logger.warning("LLM judge failed for {!r}, falling back: {}", topic, exc)
             return None, "llm"
 
-    def _run_agent(self, detector_results: dict[str, Any], data: ExtractedData) -> dict[str, Any]:
+    def _run_agent(self, detector_results: dict[str, Any], frames, imu) -> dict[str, Any]:
         """Run the Claude tool-use agentic loop; raise on any error."""
         client = anthropic.Anthropic(
             api_key=self._api_key,
             **({"base_url": self._base_url} if self._base_url else {}),
         )
-        frames = data["frames"]
-        imu = data["sensor_series"]
 
         tools = [
             {
