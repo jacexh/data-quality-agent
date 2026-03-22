@@ -1,7 +1,7 @@
 # agent/runner.py
 from __future__ import annotations
 import os
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 from loguru import logger
 from agent.config import settings
@@ -141,14 +141,29 @@ def _build_audio_result(topic: str, item: dict[str, Any]) -> AudioResult:
 
 # ── Shared analysis function ────────────────────────────────────────────────
 
-def analyze_local_file(local_path: str, source_file: str = "", bucket: str = "") -> dict:
-    """Run the full pipeline on a local MCAP file. Returns a report dict (never raises)."""
+def analyze_local_file(
+    local_path: str,
+    source_file: str = "",
+    bucket: str = "",
+    progress=None,
+) -> dict:
+    """Run the full pipeline on a local MCAP file. Returns a report dict (never raises).
+
+    Args:
+        progress: optional callable(msg: str) for progress reporting (e.g. print to stderr).
+    """
+    def _progress(msg: str) -> None:
+        if progress is not None:
+            progress(msg)
+
     src = source_file or local_path
 
+    _progress(f"[1/4] Extracting MCAP: {local_path}")
     try:
         data = _extractor.extract(local_path)
     except Exception as exc:
         logger.error("MCAP extraction failed for {!r}: {}", local_path, exc, exc_info=True)
+        _progress("      Extraction failed.")
         return _builder.build(
             source_file=src, bucket=bucket,
             duration_seconds=None,
@@ -156,6 +171,14 @@ def analyze_local_file(local_path: str, source_file: str = "", bucket: str = "")
             audio_results=[],
             analyzer_errors=["mcap_extraction"],
         )
+
+    n_cam = len(data["videos"])
+    n_aud = len(data["audios"])
+    dur = data.get("duration_seconds")
+    dur_str = f"{dur:.1f}s" if dur is not None else "unknown duration"
+    _progress(
+        f"      Done: {n_cam} camera topic(s), {n_aud} audio topic(s), {dur_str}"
+    )
 
     camera_intermediates: dict[str, dict] = {}
     audio_intermediates: dict[str, dict] = {}
@@ -180,20 +203,36 @@ def analyze_local_file(local_path: str, source_file: str = "", bucket: str = "")
             }
 
     # Detection phase: per-topic ThreadPoolExecutor (OpenCV releases GIL, no IPC needed)
+    active_cam = sum(1 for t, f in data["videos"].items() if f and t not in camera_intermediates)
+    active_aud = sum(1 for t, f in data["audios"].items() if f and t not in audio_intermediates)
+    _progress(f"[2/4] Running detectors on {active_cam} camera + {active_aud} audio topic(s)...")
     with ThreadPoolExecutor(max_workers=settings.max_concurrent_topics) as executor:
-        cam_futures = {
-            executor.submit(_run_visual_worker, topic, frames, _model_path,
-                            settings.max_analysis_dim): topic
-            for topic, frames in data["videos"].items()
-            if frames and topic not in camera_intermediates
-        }
-        aud_futures = {
-            executor.submit(_run_audio_worker, topic, audio_frames): topic
-            for topic, audio_frames in data["audios"].items()
-            if audio_frames and topic not in audio_intermediates
-        }
+        def _make_progress(prefix: str):
+            def _p(msg: str) -> None:
+                _progress(f"    {prefix}: {msg.strip()}")
+            return _p
 
-        for future, topic in cam_futures.items():
+        cam_futures: dict = {}
+        for topic, frames in data["videos"].items():
+            if frames and topic not in camera_intermediates:
+                _progress(f"    [camera] {topic} ({len(frames)} frames) → clarity, continuity, face, gait")
+                cam_futures[executor.submit(
+                    _run_visual_worker, topic, frames, _model_path,
+                    settings.max_analysis_dim,
+                    _make_progress(f"[camera] {topic}"),
+                )] = topic
+
+        aud_futures: dict = {}
+        for topic, audio_frames in data["audios"].items():
+            if audio_frames and topic not in audio_intermediates:
+                _progress(f"    [audio]  {topic} ({len(audio_frames)} frames) → voice")
+                aud_futures[executor.submit(
+                    _run_audio_worker, topic, audio_frames,
+                    _make_progress(f"[audio]  {topic}"),
+                )] = topic
+
+        for future in as_completed(cam_futures):
+            topic = cam_futures[future]
             try:
                 _, results, errors = future.result()
             except Exception as exc:
@@ -211,7 +250,8 @@ def analyze_local_file(local_path: str, source_file: str = "", bucket: str = "")
                 "llm_error": None,
             }
 
-        for future, topic in aud_futures.items():
+        for future in as_completed(aud_futures):
+            topic = aud_futures[future]
             try:
                 _, results, errors = future.result()
             except Exception as exc:
@@ -227,34 +267,51 @@ def analyze_local_file(local_path: str, source_file: str = "", bucket: str = "")
                 "llm_error": None,
             }
 
+    n_llm = sum(1 for item in camera_intermediates.values() if item["needs_llm"]) + \
+            sum(1 for item in audio_intermediates.values() if item["needs_llm"])
+    if n_llm:
+        _progress(f"[3/4] LLM review triggered for {n_llm} topic(s)...")
+    else:
+        _progress("[3/4] LLM review: not required (scores clear)")
+
     # LLM phase: concurrent ThreadPoolExecutor
     with ThreadPoolExecutor(max_workers=settings.llm_max_concurrent_calls) as executor:
-        cam_llm_futures = {
-            executor.submit(
-                _judge.judge, topic, item["results"],
-                item["frames"], None, data["sensor_series"]
-            ): topic
-            for topic, item in camera_intermediates.items() if item["needs_llm"]
-        }
-        aud_llm_futures = {
-            executor.submit(
-                _judge.judge, topic, item["results"],
-                None, item["audio_frames"], data["sensor_series"]
-            ): topic
-            for topic, item in audio_intermediates.items() if item["needs_llm"]
-        }
+        cam_llm_futures: dict = {}
+        for topic, item in camera_intermediates.items():
+            if item["needs_llm"]:
+                _progress(f"    [LLM] {topic} → sending to Claude...")
+                cam_llm_futures[executor.submit(
+                    _judge.judge, topic, item["results"],
+                    item["frames"], None, data["sensor_series"]
+                )] = topic
 
-        for future, topic in cam_llm_futures.items():
+        aud_llm_futures: dict = {}
+        for topic, item in audio_intermediates.items():
+            if item["needs_llm"]:
+                _progress(f"    [LLM] {topic} → sending to Claude...")
+                aud_llm_futures[executor.submit(
+                    _judge.judge, topic, item["results"],
+                    None, item["audio_frames"], data["sensor_series"]
+                )] = topic
+
+        for future in as_completed(cam_llm_futures):
+            topic = cam_llm_futures[future]
             llm_result, llm_error = future.result()
             camera_intermediates[topic]["llm_result"] = llm_result
             camera_intermediates[topic]["llm_error"] = llm_error
+            status = "✓ passed" if (llm_result and llm_result.get("passed")) else ("✗ failed" if llm_result else "✗ error")
+            _progress(f"    [LLM] {topic} → {status}")
 
-        for future, topic in aud_llm_futures.items():
+        for future in as_completed(aud_llm_futures):
+            topic = aud_llm_futures[future]
             llm_result, llm_error = future.result()
             audio_intermediates[topic]["llm_result"] = llm_result
             audio_intermediates[topic]["llm_error"] = llm_error
+            status = "✓ passed" if (llm_result and llm_result.get("passed")) else ("✗ failed" if llm_result else "✗ error")
+            _progress(f"    [LLM] {topic} → {status}")
 
     # Assembly phase
+    _progress("[4/4] Building report...")
     camera_results = [_build_camera_result(t, item) for t, item in camera_intermediates.items()]
     audio_results  = [_build_audio_result(t, item)  for t, item in audio_intermediates.items()]
 

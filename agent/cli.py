@@ -32,6 +32,9 @@ def main() -> None:
 
     from agent.runner import analyze_local_file
 
-    report = analyze_local_file(path)
+    def _progress(msg: str) -> None:
+        print(msg, file=sys.stderr, flush=True)
+
+    report = analyze_local_file(path, progress=_progress)
     print(json.dumps(report, ensure_ascii=False, indent=2))
     sys.exit(0 if report["overall_passed"] else 1)
