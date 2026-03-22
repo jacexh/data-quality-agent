@@ -262,34 +262,84 @@ docker-compose down
 
 ## 质量报告
 
-分析完成后，报告以结构化 JSON 输出到日志（通过 loguru）：
+分析完成后，报告以结构化 JSON 输出（Server 模式通过 loguru，CLI 模式输出到 stdout）。
 
-```json
+### Schema
+
+```
 {
-  "report_id": "uuid",
-  "source_file": "robot-uploads/session_001.mcap",
-  "minio_bucket": "robot-uploads",
-  "analyzed_at": "2026-03-20T10:00:00Z",
-  "duration_seconds": 30.5,
-  "scores": {
-    "clarity": {"score": 0.82, "method": "laplacian+tenengrad"},
-    "continuity": {"score": 0.75, "method": "farneback"}
-  },
-  "sensitive_info": {
-    "has_face": false,
-    "face_count": 0,
-    "has_human_voice": false,
-    "has_human_gait": false
-  },
-  "llm_assessment": null,
-  "llm_skipped_reason": "all_detectors_clear_no_borderline_scores",
-  "analyzer_errors": [],
-  "passed": true,
-  "failure_reasons": []
+  report_id             string        唯一报告 ID（UUID）
+  source_file           string        MCAP 文件路径或对象名
+  minio_bucket          string        来源存储桶（CLI 模式为空）
+  analyzed_at           string        ISO 8601 UTC 时间戳
+  duration_seconds      float | null  录制时长（秒）
+  camera_pass_strategy  "all"|"any"|"majority"  相机 topic 整体判定策略
+  audio_pass_strategy   "all"|"any"|"majority"  音频 topic 整体判定策略
+  cameras               CameraResult[]           逐 topic 相机分析结果
+  audios                AudioResult[]            逐 topic 音频分析结果
+  overall_passed        bool          整体是否合格
+  failure_reasons       string[]      整体不合格原因（如 duration_too_short）
+  analyzer_errors       string[]      提取阶段错误
+}
+
+CameraResult {
+  topic                 string        ROS topic 名称
+  frame_count           int           实际分析帧数
+  clarity {
+    score               float         0–1，越高越清晰
+    method              string        "laplacian+fft"
+    detail {
+      mean_laplacian_variance  float
+      fft_high_freq_ratio      float
+      frame_score_std          float
+      frame_count              int
+    }
+  }
+  continuity {
+    score               float         0–1，越高越连续
+    method              string        "optical_flow"
+    detail {
+      mean_flow_magnitude      float
+      flow_magnitude_std       float
+      flow_direction_std       float
+      discontinuity_frames     int
+      frame_count              int
+    }
+  }
+  face {
+    has_face            bool
+    face_count          int
+    face_frame_ratio    float
+    max_confidence      float
+  }
+  gait {
+    has_human_gait      bool
+    person_frame_ratio  float
+    max_detection_weight float
+  }
+  llm_assessment        object | null  LLM 裁决结果（未触发时为 null）
+  llm_skipped_reason    string | null  跳过 LLM 的原因
+  passed                bool
+  failure_reasons       string[]       如 clarity / has_face / has_human_gait
+  analyzer_errors       string[]       检测器级别错误
+}
+
+AudioResult {
+  topic                 string
+  audio_frame_count     int
+  voice {
+    has_human_voice     bool
+    speech_frame_ratio  float
+  }
+  llm_assessment        object | null
+  llm_skipped_reason    string | null
+  passed                bool
+  failure_reasons       string[]       如 has_human_voice
+  analyzer_errors       string[]
 }
 ```
 
-`passed: false` 时，`failure_reasons` 列举具体原因，如 `clarity`、`has_face`、`duration_too_short` 等。
+`overall_passed: false` 时，可从 `failure_reasons`（整体）和每个 `cameras[i].failure_reasons` / `audios[i].failure_reasons`（per-topic）定位具体原因。
 
 ## LLM 裁决逻辑
 
@@ -313,76 +363,105 @@ Claude API 异常时自动降级，仅使用检测器结果作为最终判定，
   "report_id": "0be1b8d7-39ae-440e-8b17-3edde1551a43",
   "source_file": "data/20241203_demo_Office_PickPlace_ljw_152145.mcap",
   "minio_bucket": "",
-  "analyzed_at": "2026-03-20T09:03:50Z",
-  "duration_seconds": 363.7240240573883,
-  "scores": {
-    "clarity": {
-      "score": 0.5171,
-      "method": "laplacian+fft",
-      "detail": {
-        "mean_laplacian_variance": 799.9532,
-        "fft_high_freq_ratio": 0.0051,
-        "frame_score_std": 0.0022,
-        "frame_count": 364
-      }
+  "analyzed_at": "2026-03-22T11:08:51Z",
+  "duration_seconds": 364.724,
+  "camera_pass_strategy": "all",
+  "audio_pass_strategy": "all",
+  "cameras": [
+    {
+      "topic": "/rgbd/color/image_raw/compressed",
+      "frame_count": 300,
+      "clarity": {
+        "score": 0.5171,
+        "method": "laplacian+fft",
+        "detail": {
+          "mean_laplacian_variance": 799.9532,
+          "fft_high_freq_ratio": 0.0051,
+          "frame_score_std": 0.0022,
+          "frame_count": 300
+        }
+      },
+      "continuity": {
+        "score": 0.5344,
+        "method": "optical_flow",
+        "detail": {
+          "mean_flow_magnitude": 2.256,
+          "flow_magnitude_std": 1.5424,
+          "flow_direction_std": 1.1585,
+          "discontinuity_frames": 169,
+          "frame_count": 300
+        }
+      },
+      "face": {
+        "has_face": true,
+        "face_count": 2,
+        "face_frame_ratio": 0.0067,
+        "max_confidence": 0.7684
+      },
+      "gait": {
+        "has_human_gait": true,
+        "person_frame_ratio": 0.0082,
+        "max_detection_weight": 0.6120
+      },
+      "llm_assessment": {
+        "passed": true,
+        "overrode_detector": true,
+        "override_detail": "人脸检测和步态检测均为误报：画面内容为密集文本/文档图像，算法误将文字纹理识别为人脸和步态特征。",
+        "narrative": "经逐帧审查，所有画面均为文档内容，未检测到真实活体人脸或人体步态，判定通过。",
+        "frames_reviewed": [0, 30, 60, 90, 120, 150, 180, 210, 240, 270, 299],
+        "imu_windows_reviewed": [[0, 30], [30, 60]]
+      },
+      "llm_skipped_reason": null,
+      "passed": true,
+      "failure_reasons": [],
+      "analyzer_errors": []
     },
-    "continuity": {
-      "score": 0.5344,
-      "method": "optical_flow",
-      "detail": {
-        "mean_flow_magnitude": 2.256,
-        "flow_magnitude_std": 1.5424,
-        "flow_direction_std": 1.1585,
-        "discontinuity_frames": 169,
-        "frame_count": 364
-      }
+    {
+      "topic": "/usb_cam_left/mjpeg_raw/compressed",
+      "frame_count": 300,
+      "clarity": {
+        "score": 0.88,
+        "method": "laplacian+fft",
+        "detail": {
+          "mean_laplacian_variance": 1204.3,
+          "fft_high_freq_ratio": 0.0312,
+          "frame_score_std": 0.0041,
+          "frame_count": 300
+        }
+      },
+      "continuity": {
+        "score": 0.93,
+        "method": "optical_flow",
+        "detail": {
+          "mean_flow_magnitude": 0.821,
+          "flow_magnitude_std": 0.413,
+          "flow_direction_std": 0.872,
+          "discontinuity_frames": 12,
+          "frame_count": 300
+        }
+      },
+      "face": {
+        "has_face": false,
+        "face_count": 0,
+        "face_frame_ratio": 0.0,
+        "max_confidence": 0.0
+      },
+      "gait": {
+        "has_human_gait": false,
+        "person_frame_ratio": 0.0,
+        "max_detection_weight": 0.0
+      },
+      "llm_assessment": null,
+      "llm_skipped_reason": "all_detectors_clear_no_borderline_scores",
+      "passed": true,
+      "failure_reasons": [],
+      "analyzer_errors": []
     }
-  },
-  "sensitive_info": {
-    "has_face": true,
-    "face_count": 2,
-    "has_human_voice": false,
-    "has_human_gait": true
-  },
-  "llm_assessment": {
-    "passed": true,
-    "overrode_detector": true,
-    "override_detail": "人脸检测（2张，最大置信度0.7684）和步态检测（person_frame_ratio=0.0082）均为误报：所有审查帧中均未发现真实的活体人脸或人体，画面内容为密集文本/文档图像，算法误将文字纹理识别为人脸和步态特征。清晰度（0.5171）和连续性（0.5344）分数处于边界值附近，但高拉普拉斯方差（799.95）表明图像实际清晰，低FFT高频比与文档类内容一致；IMU数据缺失，无法评估运动模糊，但无 证据表明质量下降源于传感器问题。",
-    "narrative": "经逐帧审查（共抽查17帧），所有画面均为密集文本/文档内容，未检测到任何真实活体人脸或人体步态；人脸与步态检测结果均为算法误报，由文字纹理触发。清晰度与连续性得分虽处于边界范围，但图像实际质量正常，IMU数据缺失排除了运动模糊的解释依据。综合判断，本次录制数据无真实敏感信息泄露风险，质量问题为假阳性，判定通过。",
-    "frames_reviewed": [
-      0,
-      20,
-      45,
-      60,
-      90,
-      100,
-      135,
-      150,
-      180,
-      200,
-      225,
-      250,
-      270,
-      300,
-      315,
-      340,
-      363
-    ],
-    "imu_windows_reviewed": [
-      [
-        0,
-        30
-      ],
-      [
-        30,
-        60
-      ]
-    ]
-  },
-  "llm_skipped_reason": null,
-  "analyzer_errors": [],
-  "passed": true,
-  "failure_reasons": []
+  ],
+  "audios": [],
+  "overall_passed": true,
+  "failure_reasons": [],
+  "analyzer_errors": []
 }
 ```
 
