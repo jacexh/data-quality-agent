@@ -97,6 +97,7 @@ def __init__(
     audio_topics: list[str],           # replaces audio_topic: str
     frame_sample_rate: int = 5,
     min_frames: int = 10,
+    max_frames_per_topic: int = 300,   # hard upper bound per topic after sampling
 ):
 ```
 
@@ -123,12 +124,23 @@ for schema, channel, message in reader.iter_messages(topics=all_topics):
     elif channel.topic in audios:
         audios[channel.topic].append(decode_audio(message))
 
-# Post-loop: apply frame_sample_rate and min_frames per topic
+# Post-loop: per-topic sampling pipeline
+# Step 1: frame_sample_rate — keep every Nth frame
+# Step 2: max_frames_per_topic — uniform downsample if still over limit
+# Step 3: min_frames — treat as empty if below threshold
 for topic in list(videos):
-    videos[topic] = videos[topic][::self._frame_sample_rate]
-    if len(videos[topic]) < self._min_frames:
-        logger.warning(f"Topic {topic} has only {len(videos[topic])} frames after sampling — treated as empty")
-        videos[topic] = []  # triggers "below_min_frames" failure path in runner
+    frames = videos[topic][::self._frame_sample_rate]
+    if len(frames) > self._max_frames_per_topic:
+        # Uniform downsample: pick max_frames_per_topic evenly spaced indices
+        indices = np.linspace(0, len(frames) - 1, self._max_frames_per_topic, dtype=int)
+        frames = [frames[i] for i in indices]
+    if 0 < len(frames) < self._min_frames:
+        logger.warning(
+            "Topic {} has only {} frames after sampling — treated as empty", topic, len(frames)
+        )
+        extraction_warnings[topic] = "below_min_frames"
+        frames = []
+    videos[topic] = frames
 ```
 
 Audio topics are not sub-sampled (PCM frame rate is already fixed at 30ms).
@@ -146,40 +158,82 @@ Audio topics are not sub-sampled (PCM frame rate is already fixed at 30ms).
 
 ### Layer 3: Pipeline (`pipeline.py` + `runner.py`)
 
-Analyzer signatures are **unchanged** — each analyzer receives a plain `list[np.ndarray]` (for visual) or `list[bytes]` (for audio). The routing happens in `runner.py`:
+**Per-topic detection runs in separate processes** via `ProcessPoolExecutor`. Each worker process receives the frames for one topic, instantiates a fresh `AnalysisPipeline`, runs the detectors, and returns serializable results. Within each worker, the 4 visual analyzers still run concurrently via `ThreadPoolExecutor` (unchanged).
+
+**Worker functions** (must be module-level for pickle compatibility):
 
 ```python
-# runner.py (analyze_local_file)
-camera_results: list[CameraResult] = []
-for topic, frames in data["videos"].items():
-    if not frames:
-        # Log and skip; topic recorded as failed with error "zero frames"
-        camera_results.append(_empty_camera_result(topic, "zero_frames"))
-        continue
-    results, errors = pipeline.run_visual(frames)   # pipeline extracts frames list
-    camera_results.append(_build_camera_result(topic, frames, results, errors))
+# pipeline.py — top-level functions, picklable
+def _run_visual_worker(topic: str, frames: list[np.ndarray]) -> tuple[str, dict[str, Any], list[str]]:
+    """Entry point for per-topic visual detection in a worker process."""
+    pipeline = AnalysisPipeline()
+    results, errors = pipeline.run_visual(frames)
+    return topic, results, errors
 
-audio_results: list[AudioResult] = []
-for topic, audio_frames in data["audios"].items():
-    if not audio_frames:
-        audio_results.append(_empty_audio_result(topic, "zero_frames"))
-        continue
+def _run_audio_worker(topic: str, audio_frames: list[bytes]) -> tuple[str, VoiceResult, list[str]]:
+    """Entry point for per-topic audio detection in a worker process."""
+    pipeline = AnalysisPipeline()
     voice_result, errors = pipeline.run_audio(audio_frames)
-    audio_results.append(_build_audio_result(topic, audio_frames, voice_result, errors))
+    return topic, voice_result, errors
 ```
 
-`AnalysisPipeline` gains two methods:
+`AnalysisPipeline` gains two instance methods called from within workers:
 
 ```python
 def run_visual(self, frames: list[np.ndarray]) -> tuple[dict[str, Any], list[str]]:
     # Runs clarity, continuity, face, gait in ThreadPoolExecutor
-    # Each analyzer receives frames directly (not ExtractedData)
+    # Returns (results_dict, errors_list)
 
 def run_audio(self, audio_frames: list[bytes]) -> tuple[VoiceResult, list[str]]:
-    # Runs voice detector with audio_frames directly
+    # Runs voice detector; returns (VoiceResult, errors_list)
 ```
 
-This keeps `ThreadPoolExecutor`-based error isolation for both media types.
+**Runner detection phase** uses `ProcessPoolExecutor`:
+
+```python
+# runner.py — parallel per-topic detection
+camera_intermediates: dict[str, dict] = {}
+audio_intermediates: dict[str, dict] = {}
+
+# Pre-populate empty-topic entries (no process needed)
+for topic, frames in data["videos"].items():
+    error = data["extraction_warnings"].get(topic) or ("zero_frames" if not frames else None)
+    if error:
+        camera_intermediates[topic] = {"frames": [], "results": {}, "errors": [error], "needs_llm": False}
+
+for topic, audio_frames in data["audios"].items():
+    error = data["extraction_warnings"].get(topic) or ("zero_frames" if not audio_frames else None)
+    if error:
+        audio_intermediates[topic] = {"audio_frames": [], "results": {}, "errors": [error], "needs_llm": False}
+
+# Dispatch non-empty topics to worker processes
+with ProcessPoolExecutor(max_workers=settings.max_concurrent_topics) as executor:
+    cam_futures = {
+        executor.submit(_run_visual_worker, topic, frames): topic
+        for topic, frames in data["videos"].items() if frames and topic not in camera_intermediates
+    }
+    aud_futures = {
+        executor.submit(_run_audio_worker, topic, audio_frames): topic
+        for topic, audio_frames in data["audios"].items() if audio_frames and topic not in audio_intermediates
+    }
+    for future, topic in cam_futures.items():
+        _, results, errors = future.result()
+        camera_intermediates[topic] = {
+            "frames": data["videos"][topic], "results": results, "errors": errors,
+            "needs_llm": should_invoke_llm(results, settings.clarity_threshold,
+                                           settings.continuity_threshold, settings.llm_review_margin),
+            "llm_result": None, "llm_error": None,
+        }
+    for future, topic in aud_futures.items():
+        _, voice_result, errors = future.result()
+        audio_intermediates[topic] = {
+            "audio_frames": data["audios"][topic], "results": voice_result, "errors": errors,
+            "needs_llm": voice_result.get("has_human_voice", False),
+            "llm_result": None, "llm_error": None,
+        }
+```
+
+**Serialization note:** numpy arrays are pickle-serializable. Frames are sent to worker processes via pickle. With `max_frames_per_topic=300` and a typical 1080p BGR frame (~6 MB), each topic's payload is ≤ 1.8 GB — stay within reasonable bounds by tuning `max_frames_per_topic` and `max_concurrent_topics` together. Workers are forked after extraction, so no shared memory issues.
 
 ### Layer 4: LLM Judge (`llm_judge.py`)
 
@@ -206,44 +260,30 @@ class LLMJudge:
 The runner uses an intermediate dict during the detection phase to carry frames alongside results, then runs LLM concurrently:
 
 ```python
-# runner.py — detection phase builds intermediate list (not CameraResult yet)
-camera_intermediates: list[dict] = []
-for topic, frames in data["videos"].items():
-    if not frames:
-        camera_intermediates.append({
-            "topic": topic, "frames": [], "results": {}, "errors": ["zero_frames"], "needs_llm": False,
-            "llm_result": None, "llm_error": "zero_frames",
-        })
-        continue
-    results, errors = pipeline.run_visual(frames)
-    camera_intermediates.append({
-        "topic": topic,
-        "frames": frames,
-        "results": results,
-        "errors": errors,
-        "needs_llm": should_invoke_llm(
-            results, settings.clarity_threshold, settings.continuity_threshold, settings.llm_review_margin
-        ),
-        "llm_result": None,
-        "llm_error": None,
-    })
-
-# runner.py — concurrent LLM phase
+# runner.py — concurrent LLM phase (after ProcessPoolExecutor detection phase completes)
+# camera_intermediates: dict[topic, intermediate_dict] — built by detection phase above
 with ThreadPoolExecutor(max_workers=settings.llm_max_concurrent_calls) as executor:
-    futures = {
+    cam_llm_futures = {
         executor.submit(
-            judge.judge, item["topic"], item["results"], item["frames"], None, data["sensor_series"]
-        ): item
-        for item in camera_intermediates if item["needs_llm"]
+            judge.judge, topic, item["results"], item["frames"], None, data["sensor_series"]
+        ): topic
+        for topic, item in camera_intermediates.items() if item["needs_llm"]
     }
-    for future, item in futures.items():
+    aud_llm_futures = {
+        executor.submit(
+            judge.judge, topic, item["results"], None, item["audio_frames"], data["sensor_series"]
+        ): topic
+        for topic, item in audio_intermediates.items() if item["needs_llm"]
+    }
+    for future, topic in {**cam_llm_futures, **aud_llm_futures}.items():
         llm_result, llm_error = future.result()
-        item["llm_result"] = llm_result
-        item["llm_error"] = llm_error
+        target = camera_intermediates if topic in camera_intermediates else audio_intermediates
+        target[topic]["llm_result"] = llm_result
+        target[topic]["llm_error"] = llm_error
 
-# runner.py — build final CameraResult list
-camera_results = [_build_camera_result(item) for item in camera_intermediates]
-# similarly for audio_intermediates / audio_results (pass frames=None, audio_frames=audio_frames)
+# runner.py — build final result lists
+camera_results = [_build_camera_result(topic, item) for topic, item in camera_intermediates.items()]
+audio_results  = [_build_audio_result(topic, item)  for topic, item in audio_intermediates.items()]
 ```
 
 `should_invoke_llm()` is the existing function from `llm_judge.py` — signature and logic unchanged.
@@ -324,8 +364,12 @@ camera_topics: list[str] = []                        # empty = auto-discover all
 audio_topics: list[str] = []                         # empty = auto-discover all audio topics
 camera_pass_strategy: Literal["all", "any", "majority"] = "all"
 audio_pass_strategy: Literal["all", "any", "majority"] = "all"
-llm_max_concurrent_calls: int = 4                    # cap on concurrent LLM API calls
+max_frames_per_topic: int = 300                      # hard upper bound per topic after frame_sample_rate
+max_concurrent_topics: int = 4                       # ProcessPoolExecutor worker count for detection
+llm_max_concurrent_calls: int = 4                    # ThreadPoolExecutor worker count for LLM
 ```
+
+**Memory budget guidance:** peak detection-phase memory ≈ `max_concurrent_topics × max_frames_per_topic × frame_size`. For 1080p BGR (6 MB/frame): 4 × 300 × 6 MB ≈ 7.2 GB. Tune these two settings together to fit available RAM.
 
 ---
 
@@ -386,8 +430,8 @@ overall_passed = cameras_passed and audios_passed
 | `agent/analyzers/voice.py` | `analyze(self, data: ExtractedData)` → `analyze(self, audio_frames: list[bytes])` |
 | `agent/extractor.py` | Updated `__init__` signature; `_resolve_topics()` returns all topics; per-topic bucketing + sampling + min_frames |
 | `agent/config.py` | Replace single-topic fields with list fields; add strategy fields and `llm_max_concurrent_calls` |
-| `agent/pipeline.py` | Replace `run()` with `run_visual(frames)` and `run_audio(audio_frames)` |
-| `agent/runner.py` | Per-topic intermediate loop; concurrent LLM phase with bounded thread pool; final result assembly |
+| `agent/pipeline.py` | Replace `run()` with `run_visual(frames)` and `run_audio(audio_frames)`; add top-level `_run_visual_worker` and `_run_audio_worker` picklable functions |
+| `agent/runner.py` | Per-topic `ProcessPoolExecutor` detection phase; `ThreadPoolExecutor` LLM phase; final result assembly |
 | `agent/llm_judge.py` | New `judge()` signature taking explicit `frames`/`audio_frames`; remove `data["frames"]` access |
 | `agent/report.py` | New schema with `cameras`/`audios` arrays; `evaluate_strategy()`; strategy-based `overall_passed` |
 | `tests/conftest.py` | Update `ExtractedData` fixtures to use `videos`/`audios` keys |
