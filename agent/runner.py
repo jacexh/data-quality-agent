@@ -1,7 +1,7 @@
 # agent/runner.py
 from __future__ import annotations
 import os
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 from loguru import logger
 from agent.config import settings
@@ -179,8 +179,8 @@ def analyze_local_file(local_path: str, source_file: str = "", bucket: str = "")
                 "llm_result": None, "llm_error": None,
             }
 
-    # Detection phase: per-topic ProcessPoolExecutor
-    with ProcessPoolExecutor(max_workers=settings.max_concurrent_topics) as executor:
+    # Detection phase: per-topic ThreadPoolExecutor (OpenCV releases GIL, no IPC needed)
+    with ThreadPoolExecutor(max_workers=settings.max_concurrent_topics) as executor:
         cam_futures = {
             executor.submit(_run_visual_worker, topic, frames, _model_path): topic
             for topic, frames in data["videos"].items()
