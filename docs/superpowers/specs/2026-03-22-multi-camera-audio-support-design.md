@@ -40,8 +40,9 @@ Replace flat `frames` and `audio_frames` fields with topic-keyed dicts:
 class ExtractedData(TypedDict):
     videos: dict[str, list[np.ndarray]]   # topic → BGR frame list (replaces `frames`)
     audios: dict[str, list[bytes]]         # topic → 30ms PCM frame list (replaces `audio_frames`)
-    sensor_series: dict[str, np.ndarray]   # unchanged
+    sensor_series: dict[str, np.ndarray]   # unchanged (shared across all topics)
     duration_seconds: float
+    extraction_warnings: dict[str, str]    # topic → warning reason ("below_min_frames", etc.)
 ```
 
 **Analyzer Protocol change:** The `Analyzer` Protocol's `analyze(self, data: ExtractedData)` signature changes to accept the stream directly, eliminating the need for `ExtractedData` indirection inside analyzers:
@@ -127,10 +128,14 @@ for topic in list(videos):
     videos[topic] = videos[topic][::self._frame_sample_rate]
     if len(videos[topic]) < self._min_frames:
         logger.warning(f"Topic {topic} has only {len(videos[topic])} frames after sampling — treated as empty")
-        videos[topic] = []  # triggers zero-frames failure path in runner
+        videos[topic] = []  # triggers "below_min_frames" failure path in runner
 ```
 
 Audio topics are not sub-sampled (PCM frame rate is already fixed at 30ms).
+
+**Error string distinction in runner.py:**
+- `"zero_frames"` — topic existed but had 0 messages at extraction time
+- `"below_min_frames"` — topic had messages but fewer than `min_frames` after sampling; extractor sets the list to `[]` and the runner detects an empty list — runner should check whether the extractor logged a below-min-frames warning for this topic to emit the correct error string. In practice, the extractor can signal this by returning a sentinel (e.g., a special empty subclass) or by the runner checking an `extraction_warnings: dict[str, str]` field in `ExtractedData`. The simpler implementation: add `extraction_warnings: dict[str, str]` to `ExtractedData` where the extractor writes `{topic: "below_min_frames"}` for affected topics, and the runner reads it when building intermediates.
 
 **Config migration:**
 
@@ -186,13 +191,15 @@ class LLMJudge:
         self,
         topic: str,
         detector_results: dict[str, Any],
-        frames: list[np.ndarray] | None,   # None for audio-only topics
-        audio_frames: list[bytes] | None,  # None for camera-only topics
-    ) -> dict[str, Any]:
+        frames: list[np.ndarray] | None,          # None for audio-only topics
+        audio_frames: list[bytes] | None,         # None for camera-only topics
+        sensor_series: dict[str, np.ndarray],     # shared IMU/sensor data (same for all topics)
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        # Returns (llm_result, llm_error_name) — same tuple shape as current code
         ...
 ```
 
-`_run_agent` accesses frames directly from the parameter (no longer reads `data["frames"]`). `get_key_frames` tool samples from the passed `frames` list.
+`_run_agent` receives frames and sensor_series as parameters (no longer reads `data["frames"]` or `data["sensor_series"]`). `get_key_frames` tool samples from the passed `frames` list; `get_imu_summary` tool reads from `sensor_series`.
 
 **Concurrency:** Per-topic LLM calls are dispatched via `ThreadPoolExecutor` with a cap of `settings.llm_max_concurrent_calls` (new config field, default 4). One shared `LLMJudge` instance is reused across topics (it is stateless).
 
@@ -203,7 +210,10 @@ The runner uses an intermediate dict during the detection phase to carry frames 
 camera_intermediates: list[dict] = []
 for topic, frames in data["videos"].items():
     if not frames:
-        camera_intermediates.append({"topic": topic, "frames": [], "results": {}, "errors": ["zero_frames"], "needs_llm": False})
+        camera_intermediates.append({
+            "topic": topic, "frames": [], "results": {}, "errors": ["zero_frames"], "needs_llm": False,
+            "llm_result": None, "llm_error": "zero_frames",
+        })
         continue
     results, errors = pipeline.run_visual(frames)
     camera_intermediates.append({
@@ -211,30 +221,59 @@ for topic, frames in data["videos"].items():
         "frames": frames,
         "results": results,
         "errors": errors,
-        "needs_llm": should_invoke_llm(results),  # existing function from llm_judge.py
+        "needs_llm": should_invoke_llm(
+            results, settings.clarity_threshold, settings.continuity_threshold, settings.llm_review_margin
+        ),
         "llm_result": None,
-        "llm_skipped_reason": None,
+        "llm_error": None,
     })
 
 # runner.py — concurrent LLM phase
 with ThreadPoolExecutor(max_workers=settings.llm_max_concurrent_calls) as executor:
     futures = {
-        executor.submit(judge.judge, item["topic"], item["results"], item["frames"], None): item
+        executor.submit(
+            judge.judge, item["topic"], item["results"], item["frames"], None, data["sensor_series"]
+        ): item
         for item in camera_intermediates if item["needs_llm"]
     }
     for future, item in futures.items():
-        item["llm_result"] = future.result()
+        llm_result, llm_error = future.result()
+        item["llm_result"] = llm_result
+        item["llm_error"] = llm_error
 
 # runner.py — build final CameraResult list
 camera_results = [_build_camera_result(item) for item in camera_intermediates]
-# similarly for audio_intermediates / audio_results
+# similarly for audio_intermediates / audio_results (pass frames=None, audio_frames=audio_frames)
 ```
 
-`should_invoke_llm()` is the existing function from `llm_judge.py` — no new helper needed.
+`should_invoke_llm()` is the existing function from `llm_judge.py` — signature and logic unchanged.
 
 ### Layer 5: Report (`report.py`)
 
-Final report schema:
+**`ReportBuilder.build()` new signature:**
+
+```python
+def build(
+    self,
+    source_file: str,
+    duration_seconds: float,
+    camera_results: list[CameraResult],
+    audio_results: list[AudioResult],
+    analyzer_errors: list[str],           # top-level errors (e.g., extraction failures)
+) -> dict[str, Any]:
+    cameras_passed = evaluate_strategy(
+        [r["passed"] for r in camera_results], self._settings.camera_pass_strategy
+    )
+    audios_passed = evaluate_strategy(
+        [r["passed"] for r in audio_results], self._settings.audio_pass_strategy
+    )
+    overall_passed = cameras_passed and audios_passed
+    ...
+```
+
+`evaluate_strategy()` is a module-level helper in `report.py`.
+
+**Final report schema:**
 
 ```json
 {
