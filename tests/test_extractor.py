@@ -324,25 +324,27 @@ def test_extractor_init_accepts_topic_lists():
     assert e is not None
 
 
-def test_frame_cap_applied_with_linspace():
-    """max_frames_per_topic=5 should uniformly downsample from 20 frames to 5."""
-    import numpy as np
-    from agent.extractor import McapExtractor
-
-    e = McapExtractor(
+def test_max_frames_per_topic_caps_output():
+    """Stream sampling: max_frames_per_topic is a hard cap, never exceeded."""
+    frame = np.zeros((64, 64, 3), dtype=np.uint8)
+    reg = _image_registry(frame)
+    # 20 frames, rate=1, cap=5 → expect exactly 5
+    tuples = [
+        _make_image_tuple("/cam", i * 1_000_000_000, SimpleNamespace())
+        for i in range(20)
+    ]
+    extractor = McapExtractor(
         camera_topics=["/cam"],
         audio_topics=[],
         frame_sample_rate=1,
         min_frames=1,
         max_frames_per_topic=5,
+        registry=reg,
     )
-    # Test the sampling logic directly
-    raw_frames = [np.zeros((64, 64, 3), dtype=np.uint8) for _ in range(20)]
-    frames = raw_frames[::1]  # step 1: no thinning
-    if len(frames) > 5:
-        indices = np.linspace(0, len(frames) - 1, 5, dtype=int)
-        frames = [frames[i] for i in indices]
-    assert len(frames) == 5
+    p1, p2, p3 = _patch_extractor(tuples, image_topics=["/cam"], audio_topics=[])
+    with p1, p2, p3:
+        data = extractor.extract("fake.mcap")
+    assert len(data["videos"]["/cam"]) == 5
 
 
 def test_below_min_frames_produces_warning_and_empty_list():

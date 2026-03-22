@@ -102,8 +102,9 @@ class McapExtractor:
         video_topics, audio_topics, imu_topic = self._resolve_topics(mcap_path)
         all_topics = video_topics + audio_topics + ([imu_topic] if imu_topic else [])
 
-        # Accumulate raw frames per topic
-        raw_videos: dict[str, list[np.ndarray]] = {t: [] for t in video_topics}
+        # Stream-sample frames during iteration to avoid accumulating all raw frames
+        frame_counters: dict[str, int] = {t: 0 for t in video_topics}
+        videos: dict[str, list[np.ndarray]] = {t: [] for t in video_topics}
         raw_audio_buf: dict[str, bytearray] = {t: bytearray() for t in audio_topics}
         timestamps: list[float] = []
         imu_rows: list[np.ndarray] = []
@@ -116,10 +117,14 @@ class McapExtractor:
                 timestamps.append(t)
                 topic = channel.topic
 
-                if topic in raw_videos:
-                    frame = self._registry.decode_image(schema.name, decoded_message)
-                    if frame is not None:
-                        raw_videos[topic].append(frame)
+                if topic in videos:
+                    frame_counters[topic] += 1
+                    # Keep if: this is a sample frame (0-indexed modulo) AND not yet at cap
+                    if ((frame_counters[topic] - 1) % self._frame_sample_rate == 0
+                            and len(videos[topic]) < self._max_frames_per_topic):
+                        frame = self._registry.decode_image(schema.name, decoded_message)
+                        if frame is not None:
+                            videos[topic].append(frame)
 
                 elif topic in raw_audio_buf:
                     chunk = self._registry.decode_audio(schema.name, decoded_message)
@@ -131,22 +136,16 @@ class McapExtractor:
                     if row is not None:
                         imu_rows.append(row)
 
-        # Post-loop: per-topic 3-step sampling for videos
+        # Post-loop: min_frames check for videos
         extraction_warnings: dict[str, str] = {}
-        videos: dict[str, list[np.ndarray]] = {}
-        for topic, frames in raw_videos.items():
-            frames = frames[::self._frame_sample_rate]  # step 1: frame_sample_rate thinning
-            if len(frames) > self._max_frames_per_topic:  # step 2: hard cap
-                indices = np.linspace(0, len(frames) - 1, self._max_frames_per_topic, dtype=int)
-                frames = [frames[i] for i in indices]
-            if 0 < len(frames) < self._min_frames:  # step 3: min_frames check
+        for topic, frames in videos.items():
+            if 0 < len(frames) < self._min_frames:
                 logger.warning(
                     "Topic {} has only {} frames after sampling — treated as empty",
                     topic, len(frames),
                 )
                 extraction_warnings[topic] = "below_min_frames"
-                frames = []
-            videos[topic] = frames
+                videos[topic] = []
 
         # Post-loop: convert audio buffers to PCM frame lists (no sub-sampling)
         audios: dict[str, list[bytes]] = {}
