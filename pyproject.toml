@@ -14,7 +14,7 @@ dependencies = [
     "webrtcvad>=2.0.10",
     "anthropic>=0.40",
     "loguru>=0.7",
-    "python-multipart>=0.0.9",
+    "python-multipart>=0.0.27",
     "setuptools<79",       # required by webrtcvad shim (pkg_resources); >=74 removed top-level pkg_resources
     "boto3>=1.34",
 ]
