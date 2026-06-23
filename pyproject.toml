@@ -5,7 +5,7 @@ requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.115",
     "uvicorn>=0.30",
-    "pydantic-settings>=2.0",
+    "pydantic-settings>=2.14.2",
     "mcap>=1.1",
     "mcap-ros2-support>=0.5",
     "mcap-ros1-support>=0.4",
